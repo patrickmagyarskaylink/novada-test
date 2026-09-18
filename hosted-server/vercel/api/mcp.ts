@@ -1,0 +1,2119 @@
+/**
+ * Novada MCP — Vercel Edge Function (Streamable HTTP transport)
+ *
+ * Ported from the Cloudflare Worker at ../worker/src/index.ts.
+ * Runs on the Vercel Edge Runtime — same Web APIs as CF Workers
+ * (fetch, Request, Response, crypto.subtle). KV is provided by
+ * Vercel KV (Upstash Redis under the hood) via @vercel/kv.
+ *
+ * Auth (Tavily-style, both accepted):
+ *   1. ?apikey=YOUR_NOVADA_API_KEY  (aliases: ?api_key=, legacy ?token= — all accepted, canonical is apikey)
+ *   2. Authorization: Bearer YOUR_NOVADA_API_KEY
+ *
+ * Quota: per-token monthly KV counter at <token>:<YYYY-MM>. Decrement
+ * before each tool call. 429 when exhausted.
+ */
+
+// 🔴 RUNTIME POLYFILLS — must be the VERY FIRST import (side-effect only).
+// See ./_polyfills.js for why. ESM hoists imports but resolves them in source
+// order; listing this first ensures DOMMatrix/ImageData/Path2D stubs are in
+// place before pdfjs-dist (transitively imported via pdf-parse) runs its
+// module-init code.
+import "./_polyfills.js";
+
+// ─── Error monitoring (Sentry) ────────────────────────────────────────────────
+// Captures all unhandled errors + tool-call failures so we can see what's
+// breaking for customers and improve. Set SENTRY_DSN in Vercel env vars.
+// Free tier: 5,000 errors/month — enough for monitoring hosted MCP usage.
+import * as Sentry from "@sentry/node";
+
+// ─── Behavior telemetry (metadata-only, fail-open — see ./_telemetry.ts) ─────
+import { waitUntil } from "@vercel/functions";
+import {
+  buildToolCallEvent,
+  buildInitializeEvent,
+  emitEvent,
+  encryptHqIdentity,
+} from "./_telemetry.js";
+import type { RejectionStage, AuthMethod, McpEventRow } from "./_telemetry.js";
+// HQ log-ingest push (Leo's /mcp/log/create contract) — see ./_hq_push.ts. Fail-safe
+// (no-op without NOVADA_HQ_LOG_URL) and fail-silent (never throws); chained after
+// emitEvent below so our own backup insert is always scheduled regardless of push outcome.
+import { pushToHq } from "./_hq_push.js";
+
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    tracesSampleRate: 0,  // errors only, no performance overhead
+    environment: process.env.VERCEL_ENV ?? "development",
+    // Serverless: flush events synchronously before Vercel kills the function.
+    // Without this, buffered events are dropped when the instance terminates.
+    beforeSend: (event) => event,
+  });
+}
+
+/** Flush Sentry buffer — must be awaited before returning from a serverless handler. */
+async function sentryFlush(): Promise<void> {
+  if (process.env.SENTRY_DSN) {
+    await Sentry.flush(2000).catch(() => { /* best-effort */ });
+  }
+}
+
+// ─── Sentry alert gating (noise reduction) ────────────────────────────────────
+// Every dispatch error is already handled:true (the catch returns a clean isError
+// response). Firing captureException for ALL of them pages the owner for upstream
+// weather (SERP flaked, scraper parse-fail) and user/input mistakes (bad op id,
+// invalid params, bad customer key) — none of which are our bug.
+//
+// This allowlist holds the transient-upstream + user/input NovadaError codes: for
+// those (and any ZodError) we record a forensic breadcrumb instead of an alert.
+// Everything else still alerts: non-NovadaError (TypeError etc.) and NovadaError
+// with code UNKNOWN — i.e. the buckets that may hide a real bug. Flip this set to
+// empty to instantly restore the old alert-on-everything behavior.
+const SENTRY_SUPPRESS_CODES: ReadonlySet<string> = new Set<string>([
+  // Class A — transient upstream (retry usually works, not our bug)
+  NovadaErrorCode.API_DOWN,
+  NovadaErrorCode.URL_UNREACHABLE,
+  NovadaErrorCode.TASK_PENDING,
+  NovadaErrorCode.RATE_LIMITED,
+  // Class B — user / input / customer config (agent's or caller's job to fix)
+  NovadaErrorCode.INVALID_PARAMS,
+  NovadaErrorCode.PRODUCT_UNAVAILABLE,
+  NovadaErrorCode.INVALID_API_KEY,
+  NovadaErrorCode.PROXY_AUTH_FAILURE,
+]);
+
+/**
+ * Whether a handled dispatch error warrants a Sentry error-alert (vs a breadcrumb).
+ * Returns false for handled transient/user errors (breadcrumb only); true for
+ * everything that may be a real bug (non-NovadaError, or NovadaError UNKNOWN).
+ */
+function shouldAlertSentry(error: unknown): boolean {
+  if (error instanceof ZodError) return false;             // user input — never alert
+  if (error instanceof NovadaError) return !SENTRY_SUPPRESS_CODES.has(error.code);
+  return true;                                             // unclassified → real bug → alert
+}
+
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
+  McpError,
+  ErrorCode,
+} from "@modelcontextprotocol/sdk/types.js";
+import { ZodError } from "zod";
+import { kv } from "@vercel/kv";
+// OAuth 2.1 Authorization Server (RFC 8414/9728/7591/6749/7636) — _oauth.ts is
+// import-free by design (unit-tested side-effect-free in test/oauth.test.mjs);
+// mcp.ts is the ONLY place that wires its real dependencies (Vercel KV,
+// validateToken, OAUTH_ENC_KEY) — see buildOAuthDeps below.
+import {
+  isOAuthPath,
+  handleOAuthRequest,
+  resolveAccessToken,
+  deriveIssuer,
+} from "./_oauth.js";
+import type { OAuthDeps } from "./_oauth.js";
+
+// ─── Shared catalog + dispatch from vendored core (single source of truth) ────
+// core.ts is side-effect-free: no server construction, no stdio boot, no process.exit.
+// It exports HIDDEN_ALIASES (19 npm-alias names: 9 backward-compat account/unblock
+// aliases + 6 proxy type variants + 4 scraper stubs), TOOLS (the npm-registered tool
+// catalog — name/description/inputSchema/annotations, already schema-built) and
+// dispatch() which THROWS on error and returns a bare string — all hosted transport
+// wrappers (quota, redaction, wall-clock, ALS) stay in this file.
+//
+// The hosted TOOLS array (below) is DERIVED from core's TOOLS — no hand-curated
+// duplicate listing. This is what makes the platform-scraper family (novada_scrape_amazon
+// and its 15 siblings, spread into core's catalog via PLATFORM_SCRAPER_DEFS) show up on
+// hosted automatically: adding a tool to npm-package's registry is enough, nothing in
+// this file needs editing for a name to appear (HOSTED_HIDDEN below is the only
+// exception list).
+import {
+  HIDDEN_ALIASES as NPM_HIDDEN_ALIASES,
+  TOOLS as CORE_TOOLS,
+  dispatch,
+} from "../vendor/novada-mcp/core.js";
+// Platform-scraper family metadata (name + source platform domain) — same aggregator
+// npm-package's own src/index.ts imports for its NOVADA_GROUPS "scrape"/"scraper"
+// derivation (see tests/tools/scrape-group-derivation.test.ts there). Used below to
+// derive SCRAPE_TOOLS (resume-hint wall-clock messaging) without hand-listing names.
+import { PLATFORM_SCRAPER_TOOLS } from "../vendor/novada-mcp/tools/platform_scrapers.js";
+import {
+  // novada_setup: auth-free pre-quota handler stays in mcp.ts (not routed via dispatch)
+  novadaSetup,
+  validateSetupParams,
+  // novada_discover: hosted-specific override (scopes catalog to visibleToolNames)
+  novadaDiscover,
+  validateDiscoverParams,
+} from "../vendor/novada-mcp/tools/index.js";
+import vendorPkg from "../vendor/novada-mcp/package.json" with { type: "json" };
+import { NovadaError, NovadaErrorCode } from "../vendor/novada-mcp/_core/errors.js";
+// Real upstream key verification for validateToken — same wallet-balance probe
+// novada_setup already uses to confirm "does this key actually work".
+import { devApiPost } from "../vendor/novada-mcp/_core/developer_api.js";
+// L3 unified-key: populate the request-scoped credential store with the caller's key so
+// store-reading resolvers (getWebUnblockerKey → store.apiKey, resolveProxyCredentials,
+// resolveBrowserWs) use the CALLER's key on hosted instead of falling back to server env.
+import { withCredentials, resolveBrowserWs } from "../vendor/novada-mcp/utils/credentials.js";
+// MCP prompts (tool-selection decision trees) — same module the npm server uses (1:1 parity). Static, safe on serverless.
+import { listPrompts, getPrompt } from "../vendor/novada-mcp/prompts/index.js";
+// MCP resources (catalog data: scraper platforms, search engines, countries, etc.)
+// Same module the npm stdio server uses — pure functions, safe on serverless.
+// Resources consume ZERO quota: self-diagnosis/catalog data must never be gated.
+import { listResources, readResource } from "../vendor/novada-mcp/resources/index.js";
+// Paid-tier gateway cap exemption (P0, PRD 2026-07-13): meta tools never counted/
+// blocked; over-cap calls pass when the account has real payment history (orders
+// primary, positive balance as OR-fallback). Plan resolution is LAZY — nothing is
+// looked up for keys under the cap.
+import { enforceGatewayCap, resolvePlan, fetchAggregateBalance } from "./_plan.js";
+
+// Hosted server version = `<vendored npm version>.<server build tag>-hosted`.
+//   • The npm-version part is DERIVED from the vendored package — NEVER hardcoded.
+//     (A hardcoded "0.8.2-hosted" once silently drifted two releases behind the
+//     vendored 0.8.4; deriving guarantees this part always tracks the shipped tools.)
+//   • HOSTED_BUILD tags a server-ONLY deploy that ships no npm change — e.g. this
+//     version-derive fix lives only in hosted-server/, so npm stays 0.8.4 while
+//     the hosted build is "t1". Bump it per server-only deploy; reset to "t1" (or "")
+//     whenever the vendored package version changes.
+const HOSTED_BUILD = "";
+const HOSTED_VERSION = HOSTED_BUILD
+  ? `${vendorPkg.version}.${HOSTED_BUILD}-hosted`
+  : `${vendorPkg.version}-hosted`;
+
+// ─── Single version source — propagate to all reporting surfaces ─────────────
+// HOSTED_VERSION is the ONE canonical version string for this process.  Setting it
+// in process.env at module-init time means every tool that outputs a "server_version"
+// field (setup.ts, discover.ts) reads the SAME string that serverInfo.version carries
+// in the MCP initialize response, so the invariant
+//   novada_setup output == novada_discover output == serverInfo.version
+// holds without any per-tool coupling.  The vendored config.js VERSION constant is
+// NOT used here — its relative-path resolution can silently drift when the vendor
+// layout changes, and is kept only as a stdio fallback (npm run novada-mcp has no
+// NOVADA_SERVER_VERSION set, so tools fall back to VERSION from package.json).
+process.env.NOVADA_SERVER_VERSION = HOSTED_VERSION;
+
+// ─── Vercel Function runtime (Node.js serverless) ───────────────────────────
+// NOTE: we use Node.js runtime (NOT Edge) because the underlying novada-mcp
+// tool implementations depend on Node-only modules: axios, cheerio,
+// playwright-core, exceljs, pdf-parse, and the MCP SDK uses EventEmitter.
+// Trade-off vs Edge: ~200ms cold start (vs ~50ms) + single-region (vs global edge),
+// but in exchange the full core-derived tool surface works without porting.
+// TOW2-257 (partial): raised from 60 → 300 on Pro plan (team org).
+// Pro Vercel allows up to 800s; 300s is a practical safe ceiling for MCP streaming.
+// This gives novada_research (deep mode ~30-45s) and novada_scrape (slow platforms
+// that used to exceed the 56s cap) much more headroom without the 45s internal poll
+// ceiling ever being the bottleneck.
+const FUNCTION_MAX_DURATION_S = 300;
+export const config = {
+  runtime: "nodejs",
+  maxDuration: 300, // MUST be a literal — Vercel statically parses this `config` export and cannot resolve an identifier (keep in sync with FUNCTION_MAX_DURATION_S above)
+};
+
+// #5: per-tool wall-clock budget, set a few seconds UNDER maxDuration. If a tool
+// somehow runs past this (a primitive that ignored its own ceiling, an upstream
+// stall), we throw a structured NovadaError the catch turns into a JSON-RPC error
+// envelope — the client NEVER sees the bare HTTP 504 Vercel emits on a hard kill,
+// which is not valid JSON-RPC and breaks MCP clients. The tool-level config.ts
+// ceilings (≤50s) are the primary guard; this is defense in depth.
+const TOOL_WALL_CLOCK_MS = (FUNCTION_MAX_DURATION_S - 4) * 1000; // ~296s after TOW2-257 raise
+
+// Scrape-specific cap: novada_scrape's internal POLL_TIMEOUT_MS (45s) + submit overhead
+// normally completes well under the function wall-clock. This guard fires only if the
+// upstream stalls past all tool-level ceilings. The message is scrape-aware: it mentions
+// task_id resume so the caller does NOT lose the in-flight task and can resume for free.
+// The platform-scraper family (novada_scrape_amazon and its siblings) shares scrape.ts's
+// same submit/poll engine, so they get the same resume-hint — derived from
+// PLATFORM_SCRAPER_TOOLS (not hand-listed) so a new platform config is covered with zero
+// edits here, mirroring npm-package's src/index.ts SCRAPE_GROUP derivation.
+const SCRAPE_TOOLS = new Set([
+  "novada_scrape",
+  "novada_scraper_submit",
+  ...PLATFORM_SCRAPER_TOOLS.map((t) => t.toolDefinition.name),
+]);
+
+/**
+ * Marks NovadaError instances thrown by withWallClock's OWN ceiling timeout
+ * (below) — as opposed to a genuine upstream TASK_PENDING (scrape poll still
+ * running). Both share NovadaErrorCode.TASK_PENDING (a structural defect noted
+ * in the roundtable doc §6, #15/#16 — fixing it properly is WS-B/npm-package
+ * work), so this WeakSet is the WS-A-only signal telemetry uses to tell them
+ * apart: see gateway_ceiling_hit in scheduleToolEvent below.
+ */
+const GATEWAY_CEILING_ERRORS = new WeakSet<object>();
+
+/**
+ * Race a tool promise against the wall-clock budget. On timeout, reject with a
+ * structured NovadaError (TASK_PENDING — transient + retryable) so the call still
+ * returns a JSON-RPC error envelope instead of being hard-killed into a bare 504.
+ * For scrape tools: include task_id resume hint and no-recharge reminder.
+ */
+function withWallClock<T>(toolName: string, p: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const guard = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const isScrape = SCRAPE_TOOLS.has(toolName);
+      const agent_instruction = isScrape
+        ? `The scrape task was still running when the hosted endpoint hit its wall-clock budget. ` +
+          `If the tool returned a task_id before this error, re-call novada_scrape with that task_id ` +
+          `(no new charge — it skips re-submit and goes straight to polling). ` +
+          `If no task_id was returned, retry the call. ` +
+          `For operations that reliably exceed the hosted cap, use the local MCP server ` +
+          `(\`npx novada-mcp\`) which has no per-call wall-clock limit.`
+        : `The hosted endpoint wall-clock budget (${TOOL_WALL_CLOCK_MS / 1000}s) was reached. ` +
+          `Retry with a narrower request (fewer URLs, render="static", a smaller depth/limit), ` +
+          `or run the local MCP server (\`npx novada-mcp\`) which has no per-call wall-clock cap.`;
+      const ceilingError = new NovadaError({
+        code: NovadaErrorCode.TASK_PENDING,
+        message: `${toolName} exceeded the hosted ${TOOL_WALL_CLOCK_MS / 1000}s time budget and was stopped before the function timed out.`,
+        agent_instruction,
+        retryable: true,
+      });
+      GATEWAY_CEILING_ERRORS.add(ceilingError);
+      reject(ceilingError);
+    }, TOOL_WALL_CLOCK_MS);
+  });
+  return Promise.race([p, guard]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
+// ─── Env shape (read from process.env on Vercel) ─────────────────────────────
+// Required env vars:
+//   KV_REST_API_URL           ← auto-injected when KV store is linked
+//   KV_REST_API_TOKEN         ← auto-injected when KV store is linked
+//   STUB_AUTH_WARNING_ACCEPTED ← "true" to unlock the worker (stub gate)
+//   RATE_LIMIT_PER_MIN        ← per-IP rate limit (default 60)
+//   FREE_PLAN_MONTHLY_QUOTA   ← per-token monthly quota (default 1000)
+//   LOG_LEVEL                 ← "info" | "silent"
+//   NOVADA_API_BASE           ← https://api.novada.com (informational)
+interface Env {
+  NOVADA_API_BASE: string;
+  LOG_LEVEL: string;
+  FREE_PLAN_MONTHLY_QUOTA: string;
+  STUB_AUTH_WARNING_ACCEPTED?: string;
+  RATE_LIMIT_PER_MIN?: string;
+  /** Base64 (std) 32-byte AES-256-GCM key for at-rest encryption of the caller's
+   *  Novada API key inside OAuth code/token KV records — see api/_oauth.ts. */
+  OAUTH_ENC_KEY?: string;
+}
+
+function readEnv(): Env {
+  return {
+    NOVADA_API_BASE: process.env.NOVADA_API_BASE || "https://api.novada.com",
+    LOG_LEVEL: process.env.LOG_LEVEL || "info",
+    FREE_PLAN_MONTHLY_QUOTA: process.env.FREE_PLAN_MONTHLY_QUOTA || "1000",
+    STUB_AUTH_WARNING_ACCEPTED: process.env.STUB_AUTH_WARNING_ACCEPTED,
+    RATE_LIMIT_PER_MIN: process.env.RATE_LIMIT_PER_MIN,
+    OAUTH_ENC_KEY: process.env.OAUTH_ENC_KEY,
+  };
+}
+
+// ─── OAuth deps wiring (mcp.ts is the DI root for api/_oauth.ts) ─────────────
+/**
+ * Wire _oauth.ts's OAuthDeps to the real Vercel KV client and the existing
+ * validateToken wallet-probe (same verification /mcp auth already performs) —
+ * _oauth.ts stays import-free and unit-testable; this is its ONLY real caller.
+ */
+function buildOAuthDeps(env: Env): OAuthDeps {
+  return {
+    kvGet: (key) => kv.get(key),
+    kvSet: (key, value, opts) => kv.set(key, value, opts),
+    kvGetDel: (key) => kv.getdel(key),
+    kvIncr: (key) => kv.incr(key),
+    kvExpire: (key, seconds) => kv.expire(key, seconds),
+    verifyKey: (apiKey) => validateToken(apiKey, env),
+    encKeyB64: env.OAUTH_ENC_KEY,
+    issuerOverride: process.env.OAUTH_ISSUER,
+  };
+}
+
+// ─── Server-key neutralization (TOW2-249) ────────────────────────────────────
+// OWNER DECISION: on the hosted endpoint the customer pays for their OWN Novada
+// consumption from their OWN key (the URL ?token= / Bearer). The server account
+// must NEVER fund a caller's upstream calls.
+//
+// The vendored tool logic resolves upstream credentials through a chain that
+// falls back to server env vars when the request-scoped caller key is absent:
+//   • _core/developer_api.getDeveloperApiKey()  → NOVADA_DEVELOPER_API_KEY ?? NOVADA_API_KEY
+//   • utils/credentials.getWebUnblockerKey()     → … ?? NOVADA_WEB_UNBLOCKER_KEY ?? NOVADA_API_KEY
+//   • utils/credentials.resolveProxyCredentials()→ NOVADA_PROXY_* (env creds even take PRIORITY)
+//   • utils/credentials.resolveBrowserWs()       → … ?? NOVADA_API_KEY  (does NOT read store.apiKey)
+// A hosted dispatch that dropped the caller key (novada_browser / novada_proxy —
+// core.dispatch calls them without the apiKey arg) would otherwise silently bill
+// the SERVER account through one of these fallbacks.
+//
+// Rather than fork tool logic (it has one home — npm-package/src), we make the
+// server-owned consumption creds physically unreachable IN THIS PROCESS: strip
+// them from process.env once at module load so the ONLY key any resolver can find
+// is the caller's, carried via the AsyncLocalStorage store (withCredentials) and
+// the explicit dispatch arg. Idempotent (same server value every request) and
+// serverless-isolate-safe. Ops/transport vars (KV_*, SENTRY_*, RATE_LIMIT_*,
+// STUB_AUTH_*, FREE_PLAN_*) are untouched.
+//
+// NOVADA_BROWSER_WS is captured first so the error-path redactor keeps its
+// exact-string scrub (the generic user:pass@host + *.novada.com rules still apply
+// regardless). To re-introduce a deliberate server-funded free tier, do it via a
+// NEW explicitly-named var — never by restoring these consumption fallbacks.
+const SERVER_BROWSER_WS_SNAPSHOT = process.env.NOVADA_BROWSER_WS?.trim() || "";
+const SERVER_CONSUMPTION_ENV_VARS = [
+  "NOVADA_API_KEY",
+  "NOVADA_DEVELOPER_API_KEY",
+  "NOVADA_WEB_UNBLOCKER_KEY",
+  "NOVADA_BROWSER_WS",
+  "NOVADA_PROXY_USER",
+  "NOVADA_PROXY_PASS",
+  "NOVADA_PROXY_ENDPOINT",
+  "NOVADA_RESIDENTIAL_PROXY_USER",
+  "NOVADA_RESIDENTIAL_PROXY_PASS",
+  "NOVADA_RESIDENTIAL_PROXY_ENDPOINT",
+  // proxy_static.js / proxy_dedicated.js read these directly from process.env — each
+  // holds IP:PORT:USER:PASS lines. Neither is set on hosted today (no live leak), but
+  // an operator setting one later would silently reopen a server-funded + credential-
+  // disclosure path, so strip them to honor "server consumption creds unreachable".
+  "NOVADA_STATIC_PROXY_LIST",
+  "NOVADA_DEDICATED_PROXY_LIST",
+  "NOVADA_AUTH_USER",
+  "NOVADA_AUTH_PASS",
+] as const;
+
+function stripServerConsumptionCreds(): void {
+  for (const name of SERVER_CONSUMPTION_ENV_VARS) {
+    if (name in process.env) delete process.env[name];
+  }
+}
+// Run once at cold start — before any request resolves a tool credential.
+stripServerConsumptionCreds();
+
+// ─── Tool catalog — DERIVED from core's single source of truth ───────────────
+// Every tool hosted exposes (name/description/inputSchema/annotations) comes straight
+// from CORE_TOOLS (npm-package/src/core.ts's `TOOLS`, itself filtered from
+// `_TOOL_DEFINITIONS` down to the registered/visible set — see that file's docstring).
+// No hand-curated duplicate listing: the platform-scraper family (novada_scrape_amazon
+// and its 15 siblings) is included automatically because core spreads
+// PLATFORM_SCRAPER_DEFS into `_TOOL_DEFINITIONS`. HOSTED_HIDDEN (below) is the ONLY
+// deliberate exclusion — every other core tool is visible on hosted by default.
+//
+// `title` is MCP-optional display metadata core doesn't carry (core.ts's shape is
+// name/description/inputSchema/annotations only) — preserve the hand-picked titles
+// customers already see for the original 15 tools, and derive a readable title for
+// every other tool (the newly-visible platform scrapers, primarily) from its name so
+// nothing ships titleless.
+const TOOL_TITLES: Record<string, string> = {
+  novada_search: "Web Search",
+  novada_extract: "Content Extractor",
+  novada_crawl: "Site Crawler",
+  novada_research: "Deep Research",
+  novada_map: "URL Mapper",
+  novada_scrape: "Platform Scraper",
+  novada_browser: "Browser Automation",
+  novada_proxy: "Proxy Credentials",
+  novada_discover: "Tool Discovery",
+  novada_ai_monitor: "AI Brand Monitor",
+  novada_monitor: "Page Change Monitor",
+  novada_setup: "Setup & Configuration",
+  novada_account: "Account & Billing",
+  novada_proxy_account_list: "Proxy Account List",
+  novada_proxy_account_create: "Proxy Account Create",
+};
+
+// Brand names whose correct capitalization isn't plain Titlecase-per-word — used by
+// deriveTitle below so the 15 platform-scraper tools ("novada_scrape_<platform>")
+// get correctly-branded titles instead of "Duckduckgo" / "Youtube" / "Github" /
+// "Linkedin" / "Tiktok". Keyed by the lowercase platform segment (the tool name
+// with the "novada_scrape_" prefix stripped).
+const TITLE_BRAND_MAP: Record<string, string> = {
+  amazon: "Amazon",
+  google: "Google",
+  bing: "Bing",
+  duckduckgo: "DuckDuckGo",
+  yandex: "Yandex",
+  youtube: "YouTube",
+  instagram: "Instagram",
+  facebook: "Facebook",
+  tiktok: "TikTok",
+  x: "X",
+  walmart: "Walmart",
+  shein: "SHEIN",
+  linkedin: "LinkedIn",
+  github: "GitHub",
+  perplexity: "Perplexity",
+};
+
+/** e.g. "novada_scrape_amazon" -> "Scrape Amazon", "novada_scrape_duckduckgo" ->
+ *  "Scrape DuckDuckGo". Fallback for any tool without a hand-picked title above —
+ *  used today by the 15 platform-scraper tools. Brand words use TITLE_BRAND_MAP's
+ *  correct capitalization instead of plain per-word Titlecase. */
+function deriveTitle(name: string): string {
+  return name
+    .replace(/^novada_/, "")
+    .split("_")
+    .map((w) => {
+      const lower = w.toLowerCase();
+      if (TITLE_BRAND_MAP[lower]) return TITLE_BRAND_MAP[lower];
+      return w.length ? w[0].toUpperCase() + w.slice(1) : w;
+    })
+    .join(" ");
+}
+
+const TOOLS = CORE_TOOLS.map((t) => ({
+  name: t.name,
+  title: TOOL_TITLES[t.name] ?? deriveTitle(t.name),
+  description: t.description,
+  inputSchema: t.inputSchema,
+  annotations: t.annotations,
+}));
+
+// ─── Hosted-hidden tools ──────────────────────────────────────────────────────
+// Tools present in core's catalog that are deliberately NOT surfaced on hosted —
+// either architecturally impossible on Vercel's serverless isolates, or WRITE /
+// destructive / meaningless-when-stateless and never ported to hosted:
+//   - novada_browser_flow  — keeps a persistent WS session across MULTIPLE tool
+//     calls, which a per-request serverless isolate cannot hold. (novada_browser
+//     itself IS enabled: one-shot CDP to Novada's remote cloud browser works —
+//     verified 2026-07-03.)
+//   - novada_site_copy     — writes files to disk; Vercel's function FS is read-only.
+//   - novada_ip_whitelist, novada_static_ip_mgmt, novada_capture_apikey — WRITE /
+//     destructive account-mutation actions (whitelist edits, IP purchases, API-key
+//     rotation) never ported to the hosted gateway.
+//   - novada_session_stats, novada_search_feedback — in-memory, per-process state
+//     that resets on every serverless invocation; exposing them on hosted would be
+//     misleading (always reports empty/zero).
+//   - novada_verify — never surfaced on the hosted default tool listing historically;
+//     still fully dispatchable by name (see HOSTED_ROUTABLE_ALIASES below).
+// This is now the ONLY exclusion list — TOOLS derives from core, so anything NOT
+// listed here that core registers is visible on hosted by default.
+// NOTE: novada_scraper_task_mgmt is NOT listed here even though it's also
+// never-ported — it's already invisible in raw TOOLS (npm core hides it as one
+// of its OWN HIDDEN_ALIASES, unrelated to hosted policy), so it would never be a
+// real member of the CORE_TOOLS-minus-HOSTED_HIDDEN derivation this Set's size is
+// pinned against elsewhere (test/tool-catalog-derivation.test.mjs). Its
+// exclusion from HOSTED_ROUTABLE_ALIASES is handled by
+// HOSTED_NEVER_ROUTABLE_NPM_ALIASES below instead.
+const HOSTED_HIDDEN = new Set([
+  "novada_browser_flow",
+  "novada_site_copy",
+  "novada_ip_whitelist",
+  "novada_static_ip_mgmt",
+  "novada_capture_apikey",
+  "novada_session_stats",
+  "novada_search_feedback",
+  "novada_verify",
+]);
+
+// ─── Hidden-alias allowlist (fail-safe — explicit opt-in) ────────────────────
+// Backward-compat ALIASES that must route silently on hosted = fold-targets +
+// the proxy/verify/scraper names hosted hides but still serves. NOT every tool
+// core can dispatch — the never-ported tools above (site_copy, ip_whitelist,
+// static_ip_mgmt, capture_apikey, scraper_task_mgmt, session_stats,
+// search_feedback) stay refused-by-default. A NEW core tool is refused until
+// explicitly opted in here (fail-safe direction). Some of the excluded names are
+// billable/mutating WRITE actions (static_ip_mgmt spends money, ip_whitelist
+// mutates the account) and site_copy writes to the read-only serverless FS —
+// auto-exposing them would be a security/billing regression.
+// NPM_HIDDEN_ALIASES is npm core's own "dispatched-but-unlisted" set (health*,
+// wallet*, plan, traffic, capture_logs, account_summary, unblock, 6 proxy type
+// variants, 4 scraper stubs — 19 total) — a classification about npm's OWN
+// ListTools output, independent of hosted's never-ported policy above. One of
+// those 4 scraper stubs, novada_scraper_task_mgmt, is ALSO one of the
+// never-ported tools named in the comment above — spreading NPM_HIDDEN_ALIASES
+// unfiltered let it ride through as routable (TOW2-349: canary run 31300731838
+// caught it dispatching instead of refusing with TOOL_NOT_ENABLED). Enumerate
+// any such overlaps here — one row per name, a table not a branch — so a
+// future npm hidden alias that also belongs to hosted's never-ported set is
+// excluded the same way instead of leaking through again.
+const HOSTED_NEVER_ROUTABLE_NPM_ALIASES = new Set(["novada_scraper_task_mgmt"]);
+const HOSTED_ROUTABLE_ALIASES = new Set<string>([
+  ...[...NPM_HIDDEN_ALIASES].filter((n) => !HOSTED_NEVER_ROUTABLE_NPM_ALIASES.has(n)),
+  "novada_verify",
+]);
+// NOTE: base this on the hosted-VISIBLE set (TOOLS minus HOSTED_HIDDEN), NOT raw
+// TOOLS. TOOLS is core's full 38-tool catalog (unfiltered) — a tool that is BOTH
+// in HOSTED_ROUTABLE_ALIASES and a real core tool (novada_verify: routable +
+// HOSTED_HIDDEN) is still present in raw TOOLS, so filtering against raw TOOLS
+// would wrongly conclude it's "already visible" and drop it from this set —
+// making a direct CallTool("novada_verify") fall through to the
+// hidden/unwired-on-hosted guard below and get refused with TOOL_NOT_ENABLED.
+const listedOnHosted = new Set(TOOLS.filter((t) => !HOSTED_HIDDEN.has(t.name)).map((t) => t.name));
+const HOSTED_HIDDEN_ALIASES: ReadonlySet<string> = new Set(
+  [...HOSTED_ROUTABLE_ALIASES].filter((n) => !listedOnHosted.has(n)),
+);
+
+// ─── Tool-set filtering (?tools= / ?groups=) ─────────────────────────────────
+// Lets a client request a slim toolset, e.g. ?groups=search,scrape or
+// ?tools=novada_search,novada_scrape. Matches BrightData's ?groups= pattern.
+// Fewer tools = less token overhead in the agent's context window.
+const TOOL_GROUPS: Record<string, string[]> = {
+  core: ["novada_search", "novada_extract", "novada_crawl", "novada_research", "novada_map", "novada_scrape", "novada_setup", "novada_account", "novada_monitor", "novada_discover"],
+  // Search engines: novada_search (SERP aggregator) + the 4 direct per-engine scrapers.
+  search: ["novada_search", "novada_scrape_google", "novada_scrape_bing", "novada_scrape_duckduckgo", "novada_scrape_yandex"],
+  scrape: ["novada_scrape", "novada_extract"],
+  scraper: ["novada_scrape", "novada_extract"],   // alias of `scrape` — matches npm group key so NOVADA_GROUPS config is portable across surfaces
+  crawl: ["novada_crawl", "novada_map"],
+  research: ["novada_research", "novada_discover", "novada_ai_monitor", "novada_monitor"],
+  proxy: ["novada_proxy"],
+  // 0.9.9: novada_account replaces the 7 folded billing tools in this group
+  account: ["novada_account", "novada_proxy_account_list", "novada_proxy_account_create"],
+  browser: ["novada_browser", "novada_browser_flow"],
+  // ── BD-style platform-family groups (new — slim to one vertical's tools) ────
+  ecommerce: ["novada_scrape_amazon", "novada_scrape_walmart", "novada_scrape_shein"],
+  // LinkedIn wasn't in the SOP's suggested split; grouped under `social` here (Bright
+  // Data itself files LinkedIn under social-media datasets, not a separate bucket).
+  social: ["novada_scrape_instagram", "novada_scrape_facebook", "novada_scrape_tiktok", "novada_scrape_x", "novada_scrape_youtube", "novada_scrape_linkedin"],
+  dev: ["novada_scrape_github"],
+  ai: ["novada_scrape_perplexity", "novada_ai_monitor"],
+  // ── F-1/F-7 audit (W-B1) — canonical 4-way registry partition (core/scrapers/
+  // account/meta), mirroring npm-package's src/tools/registry.ts GROUP_TOOL_NAMES.
+  // Added ADDITIVELY: "core" and "account" ABOVE already exist with a DIFFERENT,
+  // pre-existing, product-curated scope (10 and 3 tools respectively) — redefining
+  // either would silently change behavior for hosted customers already using
+  // ?groups=core/?groups=account, so this audit deliberately does NOT touch them.
+  // Only the two NEW, non-colliding keys below are added:
+  //   - "scrapers" = novada_scrape + all 15 novada_scrape_<platform> siblings (the
+  //     registry's full "scrapers" bucket — none are HOSTED_HIDDEN, so this exactly
+  //     matches local's existing NOVADA_GROUPS="scrape"/"scraper" tool SET).
+  //   - "meta" = discovery/setup tools — narrowed to the hosted-VISIBLE subset of
+  //     the registry's 4-tool "meta" bucket: novada_session_stats and
+  //     novada_search_feedback are HOSTED_HIDDEN (in-memory state that resets every
+  //     serverless invocation — see HOSTED_HIDDEN's docstring above) and must NOT
+  //     be listed in any TOOL_GROUPS array (guarded by
+  //     test/tool-catalog-derivation.test.mjs's "no HOSTED_HIDDEN tool is reachable
+  //     through any TOOL_GROUPS entry" test).
+  scrapers: ["novada_scrape", ...PLATFORM_SCRAPER_TOOLS.map((t) => t.toolDefinition.name)],
+  meta: ["novada_discover", "novada_setup"],
+};
+// Built from the hosted-VISIBLE set (TOOLS minus HOSTED_HIDDEN), not raw TOOLS —
+// otherwise a HOSTED_HIDDEN tool name (e.g. ?tools=novada_ip_whitelist) would pass
+// this validation and get added to the caller's allowed-tool set, even though it's
+// never dispatchable on hosted. Tools that must stay dispatchable-by-name despite
+// being hidden from listing (novada_verify) route through HOSTED_HIDDEN_ALIASES
+// instead — that check is independent of ALL_TOOL_NAMES/resolveAllowedTools.
+const ALL_TOOL_NAMES = new Set(TOOLS.filter((t) => !HOSTED_HIDDEN.has(t.name)).map((t) => t.name));
+
+/**
+ * Resolve the allowed-tool set from URL params. Returns null = no filter (all tools).
+ * `tools` accepts full names (novada_search) or short names (search). `groups`
+ * accepts category keys from TOOL_GROUPS. novada_setup is always allowed (auth-free helper).
+ */
+function resolveAllowedTools(url: URL): Set<string> | null {
+  const toolsParam = url.searchParams.get("tools");
+  const groupsParam = url.searchParams.get("groups");
+  if (!toolsParam && !groupsParam) {
+    // Default: expose ALL tools (minus HOSTED_HIDDEN, filtered in buildServer) so a first-time
+    // chatbox user can discover + use every product — extract, proxy, scraper, account —
+    // without knowing to pass ?groups=. Slim with ?groups=core or ?tools=…
+    // when a smaller context window is preferred.
+    return null;
+  }
+  const allowed = new Set<string>(["novada_setup"]);
+  if (groupsParam) {
+    const groups = groupsParam.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    // "all" = no filter, expose every tool
+    if (groups.includes("all")) return null;
+    for (const g of groups) {
+      (TOOL_GROUPS[g] ?? []).forEach((n) => allowed.add(n));
+    }
+  }
+  if (toolsParam) {
+    for (const raw of toolsParam.split(",").map((s) => s.trim()).filter(Boolean)) {
+      const full = raw.startsWith("novada_") ? raw : `novada_${raw}`;
+      if (ALL_TOOL_NAMES.has(full)) allowed.add(full);
+    }
+  }
+  // If params were given but matched nothing real, fall back to core (not all — a typo shouldn't
+  // grant broader access than no params at all).
+  if (allowed.size <= 1) {
+    return new Set([...TOOL_GROUPS["core"], "novada_setup"]);
+  }
+  return allowed;
+}
+
+// ─── Token auth + quota ──────────────────────────────────────────────────────
+interface TokenInfo {
+  valid: boolean;
+  plan: "free" | "pro";
+  quota_remaining: number;
+}
+
+// Root-cause incident: a misconfigured connector carried a format-valid token
+// belonging to a DIFFERENT Novada account. The old format-only check accepted
+// it and silently proxied every call to the wrong account — nobody noticed
+// until they inspected their wallet balance. Real verification below closes
+// that gap: a real upstream call, cheap/fast, that fails loudly on rejection.
+const TOKEN_VERIFY_TIMEOUT_MS = 3_500;
+
+// Hosted runs stateless-per-request (no session reuse across calls — see module
+// header), so without a cache EVERY tool call from EVERY customer would pay a live
+// upstream round-trip to api-m.novada.com just to re-confirm a key it already
+// confirmed moments ago. This short-TTL cache reuses the last EXPLICIT upstream
+// verdict (pass or explicit reject) so repeat calls from the same key skip the
+// upstream call entirely and pay only a KV read (same infra already used for the
+// quota/rate-limit counters below — no second caching technology introduced).
+// TTL picked in the middle of the 60-120s range: long enough to absorb a hot
+// key's typical per-minute call burst, short enough that a key disabled mid-session
+// is re-checked well within the same working session.
+const TOKEN_VERIFY_CACHE_TTL_S = 90;
+
+interface CachedTokenVerify {
+  valid: boolean;
+  verified: boolean;
+  /**
+   * Wallet balance captured from the verification probe (P0 paid-tier fix):
+   * reused as the over-cap OR-fallback signal so the cap boundary doesn't pay
+   * a second /v1/wallet/balance round-trip. Optional — absent on the
+   * format-only fallback path and on older cache entries.
+   */
+  balance?: number;
+}
+
+/** Best-effort cache write — a KV hiccup here must never block the auth decision already made. */
+async function cacheTokenVerify(cacheKey: string, result: CachedTokenVerify): Promise<void> {
+  try {
+    await kv.set(cacheKey, result, { ex: TOKEN_VERIFY_CACHE_TTL_S });
+  } catch {
+    /* best-effort — a caching failure must not surface over the (already-decided) auth result */
+  }
+}
+
+/**
+ * Validate a Novada API key: format check, then a REAL upstream probe against
+ * the wallet-balance endpoint (the same cheap "does this key work" call
+ * novada_setup already uses — one lightweight read, no side effects), fronted
+ * by a short-TTL cache of the last explicit verdict (see TOKEN_VERIFY_CACHE_TTL_S).
+ *
+ * - Format invalid → reject immediately, no upstream call, no cache read/write.
+ * - Cache hit (valid TTL) → reuse the last explicit verdict, no upstream call.
+ * - Upstream explicitly rejects the key (INVALID_API_KEY) → reject, cache the rejection.
+ * - Upstream accepts the key → cache the pass.
+ * - Upstream times out / network error (NOT an explicit rejection) → do NOT
+ *   hard-fail the request on a flaky upstream; fall back to the format-only
+ *   pass so the endpoint doesn't become less available than before this
+ *   change. `verified: false` marks this path distinctly so it can be told
+ *   apart from a clean pass in logs. This outcome is NEVER cached — it is a
+ *   transient failure, not a real verification result, and caching it would
+ *   suppress a real check for the full TTL if the flake clears a moment later.
+ * TODO(sub2api): wire to sub2api for per-user plan/quota resolution.
+ */
+async function validateToken(token: string, env: Env): Promise<TokenInfo & { verified: boolean; balance?: number }> {
+  // Accept any non-empty token that looks like a valid API key (alphanumeric, 16+ chars).
+  if (!token || token.length < 16 || !/^[a-zA-Z0-9_\-]+$/.test(token)) {
+    return { valid: false, plan: "free", quota_remaining: 0, verified: false };
+  }
+  const monthlyQuota = parseInt(env.FREE_PLAN_MONTHLY_QUOTA || "1000", 10);
+
+  // tokenKvHash (not the plaintext key) is the cache key — same rule as the quota
+  // counters: the plaintext API key must never be a KV key (see tokenKvHash).
+  const cacheKey = `tokver:${await tokenKvHash(token)}`;
+  try {
+    const cached = await kv.get<CachedTokenVerify>(cacheKey);
+    if (cached) {
+      return {
+        valid: cached.valid,
+        plan: "free",
+        quota_remaining: cached.valid ? monthlyQuota : 0,
+        verified: cached.verified,
+        balance: cached.balance,
+      };
+    }
+  } catch {
+    // KV read failure — fall through to a live upstream check; never block auth on cache.
+  }
+
+  try {
+    const data = await devApiPost("/v1/wallet/balance", {}, { apiKey: token, timeoutMs: TOKEN_VERIFY_TIMEOUT_MS }) as { balance?: unknown };
+    // P0 paid-tier fix: keep the balance the probe already fetched — the over-cap
+    // gate reuses it as the OR-fallback signal instead of a second upstream call.
+    const balance = typeof data?.balance === "number" ? data.balance : undefined;
+    await cacheTokenVerify(cacheKey, { valid: true, verified: true, balance });
+    return { valid: true, plan: "free", quota_remaining: monthlyQuota, verified: true, balance };
+  } catch (e) {
+    if (e instanceof NovadaError && e.code === NovadaErrorCode.INVALID_API_KEY) {
+      // Explicit auth rejection from Novada — this key does not belong to any
+      // account (or was disabled). Fail fast; do NOT fall through to dispatch.
+      await cacheTokenVerify(cacheKey, { valid: false, verified: true });
+      return { valid: false, plan: "free", quota_remaining: 0, verified: true };
+    }
+    // Timeout / network / transient upstream failure — NOT a rejection. Falling
+    // back to format-only here (rather than failing the request) keeps the
+    // hosted endpoint's availability decoupled from developer-api's uptime.
+    // `verified: false` lets logs distinguish "we didn't actually check" from
+    // a clean pass, without blocking the caller. Deliberately NOT cached (see
+    // function doc above).
+    console.error(JSON.stringify({
+      evt: "token_verify_fallback",
+      reason: e instanceof Error ? e.message.slice(0, 200) : String(e),
+    }));
+    return { valid: true, plan: "free", quota_remaining: monthlyQuota, verified: false };
+  }
+}
+
+/**
+ * Cheap per-IP PRE-AUTH rate limit (G-5 / V2-N4). Returns true if the caller's
+ * IP has already made RATE_LIMIT_PER_MIN requests this minute, BEFORE any of:
+ *   - validateToken's KV read + live upstream `POST /v1/wallet/balance` probe
+ *     (mcp.ts ~line 707), which a fresh format-valid-but-unknown random token
+ *     burns on every call (the 90s verdict cache only absorbs repeats of the
+ *     SAME token — unique dummy keys are trivial to generate);
+ *   - emitGuardRejection's AES-encrypt + Supabase telemetry emit, which V2-N4
+ *     found ALSO ran pre-rate-limit on every rejected attempt.
+ * This is intentionally the cheapest possible gate: one atomic KV incr (same
+ * mechanics as rateLimitExceeded below, separate `pra:` key namespace so this
+ * bucket is never starved by, or starves, the post-auth one) and — critically
+ * — NO telemetry emit on rejection. Emitting telemetry here would just move
+ * the amplification target rather than closing it.
+ * Same per-minute window and default threshold as rateLimitExceeded (both
+ * read RATE_LIMIT_PER_MIN); this is a cost breaker, not a fairness policy, so
+ * sharing the default is deliberate rather than requiring a second env var.
+ */
+async function preAuthRateLimitExceeded(ip: string, env: Env): Promise<boolean> {
+  if (!ip || ip === "unknown") return false;
+  const limit = parseInt(env.RATE_LIMIT_PER_MIN || "60", 10);
+  const bucket = Math.floor(Date.now() / 60_000);
+  const key = `pra:${ip}:${bucket}`;
+  const count = await kv.incr(key);
+  if (count === 1) await kv.expire(key, 120);
+  return count > limit;
+}
+
+/**
+ * Per-IP rate limit using Vercel KV. Returns true if rate exceeded → 429.
+ * Keyed by IP + current minute bucket. TTL 2 min for KV GC headroom.
+ * Defaults to 60 calls/min/IP (generous — legitimate agents won't hit).
+ * Runs AFTER auth (validateToken) — see preAuthRateLimitExceeded above for
+ * the cheap gate that runs BEFORE auth to bound unmetered pre-auth cost.
+ */
+async function rateLimitExceeded(ip: string, env: Env): Promise<boolean> {
+  if (!ip || ip === "unknown") return false;
+  const limit = parseInt(env.RATE_LIMIT_PER_MIN || "60", 10);
+  const bucket = Math.floor(Date.now() / 60_000);
+  const key = `rl:${ip}:${bucket}`;
+  // Atomic increment — read-modify-write would let concurrent requests in the
+  // same minute bucket each read a stale count and all slip past the limit.
+  const count = await kv.incr(key);
+  // Set the bucket TTL once, on the first hit (count === 1 means we just created it).
+  if (count === 1) await kv.expire(key, 120);
+  return count > limit;
+}
+
+/** Short stable identifier for a token, safe to log (SHA-256 first 12 hex chars). */
+async function tokenFingerprint(token: string): Promise<string> {
+  const data = new TextEncoder().encode(token);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  const hex = Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return hex.slice(0, 12);
+}
+
+/**
+ * Full SHA-256 hex of a token, used as the KV key for quota counters. The
+ * plaintext API key must NEVER be a KV key — KV keys can surface in logs,
+ * dashboards, and key-scan output, leaking the customer's credential. The full
+ * 64-char digest (not the 12-char log fingerprint) keeps collisions negligible.
+ */
+async function tokenKvHash(token: string): Promise<string> {
+  const data = new TextEncoder().encode(token);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function monthKey(): string {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+/**
+ * Returns the new remaining count, or -1 if the request must be rejected.
+ * `tokenHash` is the SHA-256 hex of the API key — the plaintext key must never
+ * be a KV key (see tokenKvHash). Uses an atomic increment instead of a
+ * get-then-set so concurrent calls can't both read the same stale count and
+ * over-spend the quota (TOCTOU). If the increment pushes a free-plan account
+ * past its cap, the speculative increment is rolled back so an exhausted key's
+ * counter can't drift upward unbounded under load.
+ */
+async function decrementQuota(tokenHash: string, env: Env, plan: "free" | "pro"): Promise<number> {
+  const monthlyQuota = parseInt(env.FREE_PLAN_MONTHLY_QUOTA || "1000", 10);
+  const key = `${tokenHash}:${monthKey()}`;
+  const used = await kv.incr(key);
+  // Set the 32-day TTL once, on the first hit — KV will GC the key after the
+  // month rolls over. (count === 1 means we just created it.)
+  if (used === 1) await kv.expire(key, 60 * 60 * 24 * 32);
+  if (plan === "free" && used > monthlyQuota) {
+    // Over cap — undo the speculative increment and reject. Guard the rollback: a failed kv.decr
+    // must not throw out of decrementQuota (that would skip the caller's refund path and leave a
+    // phantom over-cap charge). Best-effort, mirroring refundQuota. (NOV-573 review)
+    try { await kv.decr(key); } catch { /* best-effort rollback */ }
+    return -1;
+  }
+  return Math.max(0, monthlyQuota - used);
+}
+
+/**
+ * Reverse one decrementQuota when the tool call did NOT do useful work (NOV-578).
+ * Quota is decremented BEFORE the tool runs (so an abusive loop can't burn free
+ * credits faster than KV updates) — but upstream/transport/validation failures
+ * must not charge the customer. Best-effort: floors at 0 and never throws, so a
+ * refund hiccup can't mask the original tool error. Mirrors decrementQuota's
+ * atomic increment + 32-day TTL. `tokenHash` is the SHA-256 hex of the API key
+ * (the plaintext key is never a KV key — see tokenKvHash).
+ */
+async function refundQuota(tokenHash: string, env: Env): Promise<void> {
+  try {
+    const key = `${tokenHash}:${monthKey()}`;
+    // Atomic decrement, mirroring decrementQuota's incr. Floor at 0: if a
+    // concurrent reset/GC already cleared the counter, undo the over-decrement.
+    const after = await kv.decr(key);
+    if (after < 0) await kv.set(key, "0", { ex: 60 * 60 * 24 * 32 });
+  } catch {
+    /* best-effort — never let a refund failure surface over the tool error */
+  }
+}
+
+// NOTE (P0 paid-tier fix): the old "account graceful-degradation quota refund"
+// block that lived here (charge-then-refund via degradation-marker sniffing) is
+// GONE — the whole novada_account family is CAP_EXEMPT now (see ./_plan.ts
+// CAP_EXEMPT_TOOLS / ACCOUNT_TOOL_NAMES), so those calls are never charged and
+// there is nothing to refund.
+
+// ─── First-run notice (TOW2-242) ─────────────────────────────────────────────
+// One-time onboarding notice, shown EXACTLY ONCE per token on the hosted endpoint.
+// The canonical copy + stdio logic live in the vendored module
+// ../vendor/novada-mcp/utils/first-run-notice.ts (FIRST_RUN_NOTICE). We do NOT
+// import it here: the vendor dir is regenerated at deploy time and is stale between
+// deploys, so importing would break the local tsc gate. Per the TOW2-242 design's
+// explicit fallback, we duplicate ONLY the constant inline (KEEP IN SYNC with the
+// module) and implement a KV-backed store here (KV is hosted-only). To remove the
+// feature on hosted: delete this block + the two call sites below (grep TOW2-242).
+const FIRST_RUN_NOTICE =
+  "💡 First time using Novada MCP? Get your own API key + $10 free credits at https://novada.com — this notice shows only once.";
+
+// 180-day TTL: a returning token inside the window stays "noticed"; beyond it the KV
+// key GCs and the notice may show once more. Acceptable for a soft onboarding nudge.
+const FIRST_RUN_TTL_SECONDS = 60 * 60 * 24 * 180;
+
+/**
+ * Returns the first-run notice for this token on its FIRST hosted call, else null.
+ *
+ * Fail-quiet contract (mirrors the vendored module):
+ *  - Kill switch env set → null (never emit).
+ *  - KV unavailable / any KV error → treat as already-noticed → null (never spam,
+ *    never block a tool result).
+ *  - Mark-before-return: SET the flag BEFORE returning the notice so a crash can't
+ *    double-show it. Key is `noticed:<12-hex token fingerprint>` — never the raw
+ *    token (KV keys can surface in logs; see tokenFingerprint / tokenKvHash).
+ */
+async function maybeGetFirstRunNoticeHosted(token: string): Promise<string | null> {
+  if (process.env.NOVADA_DISABLE_FIRST_RUN_NOTICE) return null;
+  try {
+    const fp = await tokenFingerprint(token);
+    const key = `noticed:${fp}`;
+    // SET only if absent (NX). `nx:true` returns null when the key already exists →
+    // already noticed. A truthy result means we just claimed the first-run slot.
+    const claimed = await kv.set(key, Date.now(), { nx: true, ex: FIRST_RUN_TTL_SECONDS });
+    if (!claimed) return null;
+    return FIRST_RUN_NOTICE;
+  } catch {
+    // KV missing/errored → fail quiet as "already noticed" so we never block or spam.
+    return null;
+  }
+}
+
+/**
+ * Extracts the caller's API key AND which auth branch matched — auth_method is
+ * a security-relevant telemetry signal (path-auth = key-in-URL) per the
+ * roundtable doc §2.3/§4: "path-auth=key-in-URL 的安全信号".
+ */
+function extractToken(req: Request): { token: string; authMethod: AuthMethod } | null {
+  // Vercel Node.js Functions: req.url is path-only ("/mcp"). Vercel Edge: it's
+  // the absolute URL. Provide a base so URL parsing works in both runtimes.
+  const base = `https://${req.headers.get("host") || "localhost"}`;
+  const url = new URL(req.url, base);
+
+  // 1. Path-based auth (Firecrawl pattern): /:key/mcp
+  //    Vercel rewrite may inject ?pathKey=:key, OR Node runtime may show the original path.
+  const pathKey = url.searchParams.get("pathKey");
+  if (pathKey && pathKey.trim().length >= 16) return { token: pathKey.trim(), authMethod: "path" };
+  const pathAuthMatch = url.pathname.match(/^\/([a-zA-Z0-9_\-]{16,})\/mcp$/);
+  if (pathAuthMatch) return { token: pathAuthMatch[1], authMethod: "path" };
+
+  // 2. Query param: ?apikey= is canonical (matches the NOVADA_API_KEY brand and is
+  //    the only form shown in UI/docs). ?api_key= (novada-web parity) and the legacy
+  //    ?token= are accepted as silent aliases so pre-existing links keep working.
+  //    First non-empty wins.
+  const qp = url.searchParams.get("apikey")
+    || url.searchParams.get("api_key")
+    || url.searchParams.get("token");
+  if (qp) return { token: qp.trim(), authMethod: "query" };
+
+  // 3. Bearer header: Authorization: Bearer YOUR_API_KEY
+  const auth = req.headers.get("authorization") || req.headers.get("Authorization");
+  if (auth && /^Bearer\s+/i.test(auth)) return { token: auth.replace(/^Bearer\s+/i, "").trim(), authMethod: "bearer" };
+  return null;
+}
+
+// ─── Two-phase telemetry: CAPTURE (durable, awaited) vs DELIVERY (best-effort, waitUntil) ──
+// Root cause fixed here (2026-08-26): mcp.ts used to wrap BOTH the mcp_events
+// INSERT (emitEvent) and the HQ push (pushToHq) inside waitUntil — a
+// best-effort callback Vercel runs "if the function instance survives long
+// enough." If the instance froze or was recycled before that callback ran,
+// the row was NEVER written at all (not "pending", not "failed" — simply
+// absent), which is indistinguishable from "no traffic happened" and cannot
+// be reconciled after the fact. CAPTURE (this helper) is now AWAITED before
+// every guard-rejection/tool-call response returns, so the row's existence no
+// longer depends on the function instance surviving past the response.
+// DELIVERY (pushToHq, still scheduled via waitUntil at each call site below)
+// keeps its original best-effort timing — a dropped push still leaves a
+// `pending`/`failed` row for the reconciler cron to pick up within ~5-15 min, so
+// there is no durability requirement on the push leg the way there is on the
+// insert leg.
+//
+// captureEvent() itself NEVER throws (emitEvent already never throws — this
+// wraps it defensively in case a future emitEvent change regresses that
+// contract) and is bounded by emitEvent's own TELEMETRY_TIMEOUT_MS (3s) abort,
+// so awaiting it adds at most ~3s of latency in the worst case (a stalled
+// Supabase endpoint), typically <50ms. On the defensive catch path, it falls
+// back to the OLD fire-and-forget waitUntil insert (best-effort, same as
+// before this fix) and logs a distinct `capture_degraded` line so ops can see
+// whenever this fallback is actually exercised (should be near-never given
+// emitEvent's own fail-open contract).
+async function captureEvent(row: McpEventRow): Promise<void> {
+  try {
+    await emitEvent(row);
+  } catch (err) {
+    console.error(JSON.stringify({
+      evt: "capture_degraded",
+      request_id: row.request_id,
+      event_type: row.event_type,
+      tool: row.tool,
+      msg: "awaited emitEvent() threw unexpectedly — falling back to fire-and-forget waitUntil insert",
+      error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+    }));
+    try { waitUntil(emitEvent(row).catch(() => { /* fail-open, matches emitEvent's own contract */ })); }
+    catch { /* outside Vercel context (e.g. local dev / tests) */ }
+  }
+}
+
+/**
+ * Emits a telemetry row for a request rejected BEFORE a tool name is even known
+ * (pre_auth / rate_limited guard sites in fetchHandler, ahead of buildServer).
+ * AWAITED by every call site below, before its corresponding rejection
+ * response returns (see captureEvent's doc comment above for why). pre_auth
+ * rows are never pushed to HQ (reconcile-core.ts's buildUndeliveredQuery
+ * explicitly excludes rejection_stage=pre_auth — an unattributable/bad-key
+ * attempt has nothing for HQ to attribute), so this only ever does the
+ * CAPTURE leg — there is no DELIVERY leg to schedule here.
+ *
+ * `token` is the RAW presented key when one exists (even a rejected one — HQ
+ * identity resolution still wants to know which account attempted the call);
+ * null only for MISSING_TOKEN, where there is nothing to hash or encrypt.
+ *
+ * The ENTIRE body (row construction + captureEvent) is wrapped in a single
+ * try/catch — matching the original fire-and-forget IIFE's single
+ * `.catch(() => {})` that covered this whole chain. captureEvent() alone
+ * never throws, but tokenKvHash/encryptHqIdentity/buildToolCallEvent run
+ * BEFORE it and are NOT individually guarded — narrowing this function's
+ * safety net to only the final emitEvent call (as an earlier draft of this
+ * fix did) would let a hash/encrypt failure escape into the caller's 401/429
+ * response path. This function must be AT LEAST as fail-open as the code it
+ * replaced, never less.
+ */
+async function emitGuardRejection(params: {
+  requestId: string;
+  token: string | null;
+  outcome: string;
+  rejectionStage: RejectionStage;
+  authMethod: AuthMethod | null;
+  userAgent: string | null;
+}): Promise<void> {
+  try {
+    const tokenHash = params.token ? await tokenKvHash(params.token) : null;
+    const hq = params.token
+      ? await encryptHqIdentity(params.token)
+      : { hq_identity: null, key_version: null };
+    const row = buildToolCallEvent({
+      request_id: params.requestId,
+      token_hash: tokenHash,
+      plan: null,
+      client_name: null,
+      client_version: null,
+      protocol_version: null,
+      tool: null,
+      args: null,
+      outcome: params.outcome,
+      latency_ms: 0,
+      charged: false,
+      over_cap_allowed: false,
+      quota_remaining: 0,
+      server_version: process.env.NOVADA_SERVER_VERSION ?? null,
+      region: process.env.VERCEL_REGION ?? null,
+      rejection_stage: params.rejectionStage,
+      auth_method: params.authMethod,
+      user_agent: params.userAgent,
+      hq_identity: hq.hq_identity,
+      key_version: hq.key_version,
+    });
+    await captureEvent(row);
+  } catch (err) {
+    // Fail-open, matching the original code's whole-chain `.catch(() => {})`
+    // — a row could not even be BUILT (nothing for captureEvent's own
+    // fallback to retry), so this is a distinct, coarser degradation than
+    // captureEvent's internal capture_degraded log.
+    console.error(JSON.stringify({
+      evt: "capture_degraded",
+      request_id: params.requestId,
+      msg: "emitGuardRejection threw before a row could be built — telemetry row dropped, rejection response unaffected",
+      error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+    }));
+  }
+}
+
+function logUsage(env: Env, token: string, tool: string, ok: boolean, ms: number): void {
+  if ((env.LOG_LEVEL ?? "info") !== "silent") {
+    tokenFingerprint(token).then((fp) => {
+      console.log(JSON.stringify({ evt: "usage", tokenFp: fp, tool, ok, ms }));
+    }).catch(() => {});
+  }
+}
+
+// ─── Output sanitization for hosted ──────────────────────────────────────────
+// Strip verbose sections that waste tokens on hosted: Agent Memory (no persistent
+// memory), Output Saved (no filesystem), Extraction Diagnostics (debug noise),
+// Same-Domain Links (map tool available). Saves ~15-30% tokens per response.
+const STRIP_SECTIONS = [
+  /\n+## Output Saved\n[\s\S]*?(?=\n## |\n---\n|$)/g,
+  /\n+## Agent Memory\n[\s\S]*?(?=\n## |\n---\n|$)/g,
+  /\n+## Extraction Diagnostics\n[\s\S]*?(?=\n## |\n---\n|$)/g,
+  /\n+## Same-Domain Links[^\n]*\n[\s\S]*?(?=\n## |\n---\n|$)/g,
+  /\n+Output saved: [^\n]+/g,
+  /\n+\/\/ Output saved: [^\n]+/g,
+];
+
+function sanitizeHostedOutput(text: string): string {
+  let result = text;
+  for (const pattern of STRIP_SECTIONS) {
+    result = result.replace(pattern, "");
+  }
+  // Collapse multiple consecutive blank lines into one
+  result = result.replace(/\n{3,}/g, "\n\n");
+  return result.trim();
+}
+
+// ─── Truthful gateway status footer (ITEM 6 / Phase D) ──────────────────────
+// Every successful tool response carries exactly ONE of three status lines.
+// The lines encode the real access regime for this call — agents and users can
+// always see how quota was consumed (or not) without guessing.
+//
+// gate semantics from enforceGatewayCap:
+//   charged=true  overCapAllowed=false → real free-plan decrement (under cap)
+//   charged=false overCapAllowed=true  → paid account, no cap applies
+//   charged=false overCapAllowed=false → cap-exempt meta tool (never decremented)
+//
+// PRINCIPLE: "A confident wrong value is worse than no field."
+// Per-call cost cannot be computed truthfully (no per-call billing signal from
+// upstream — verified 2026-07-13). Report cost as explicitly unknown, NEVER
+// a number. The dashboard link gives users the authoritative view.
+function buildStatusFooter(
+  gate: { charged: boolean; overCapAllowed: boolean; remaining: number },
+  monthlyQuota: number,
+): string {
+  if (gate.charged && !gate.overCapAllowed) {
+    // Free-plan call that consumed one quota unit.
+    return `\n\n---\n⚠ gateway: ${gate.remaining}/${monthlyQuota} free calls remaining this month · cost: unknown — see dashboard.novada.com`;
+  }
+  if (gate.overCapAllowed) {
+    // Paid account: cap does not apply. No N/M counter — it would be meaningless.
+    return `\n\n---\ngateway: uncapped (paid account) · cost: unknown — see dashboard.novada.com`;
+  }
+  // Cap-exempt meta tool (novada_setup, novada_discover, novada_account family):
+  // the quota counter was never touched.
+  return `\n\n---\ngateway: free call — no quota consumed`;
+}
+
+// Sentinel gate object for the novada_setup path, which exits BEFORE the gate is
+// evaluated. novada_setup is auth-free and always exempt — use the exempt footer.
+const SETUP_GATE = { charged: false, overCapAllowed: false, remaining: 0 };
+
+// ─── Credential / internal-host redaction for the hosted error path (#2-hosted) ──
+// A raw upstream error string (axios message, response body, stack) can carry the
+// customer's credential as URL userinfo (`https://user:pass@host`) or an INTERNAL
+// Novada host (e.g. the Browser API CDP host `upg-scbr2.novada.com`). BOTH the
+// NovadaError branch and the NON-NovadaError fallback below route their message
+// through this redactor — the currently vendored errors.js (0.8.2-dev) does NOT
+// self-redact in toAgentString(), so the hosted endpoint must defend itself here
+// regardless of which package version is vendored. This mirrors the source-of-truth
+// redactSecrets() in novada-mcp/_core/errors.ts.
+const PUBLIC_NOVADA_HOSTS = new Set([
+  "novada.com",
+  "www.novada.com",
+  "dashboard.novada.com",
+  "status.novada.com",
+  "mcp.novada.com",
+  "docs.novada.com",
+]);
+
+function redactHostedSecrets(msg: string): string {
+  let out = msg;
+  // 1. Exact server NOVADA_BROWSER_WS value (contains user:pass@host) — redact first.
+  // The var itself is stripped from process.env at cold start (TOW2-249), so we use
+  // the pre-strip snapshot; the generic user:pass@host + *.novada.com rules below
+  // still scrub any per-caller browser WS regardless.
+  if (SERVER_BROWSER_WS_SNAPSHOT) out = out.split(SERVER_BROWSER_WS_SNAPSHOT).join("[browser-ws-endpoint]");
+  // 2. URL userinfo in any scheme (http/https/ws/wss): strip `user:pass@`.
+  out = out.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/@\s:]+(?::[^/@\s]*)?@/gi, "$1");
+  // 3. Internal *.novada.com hosts not on the public allowlist → placeholder.
+  out = out.replace(/\b(?:[a-z0-9-]+\.)+novada\.com\b/gi, (host) =>
+    PUBLIC_NOVADA_HOSTS.has(host.toLowerCase()) ? host : "[novada-internal-host]"
+  );
+  return out;
+}
+
+// ─── MCP server factory ──────────────────────────────────────────────────────
+function buildServer(apiKey: string, env: Env, ctx: { token: string; tokenHash: string; allowedTools?: Set<string> | null; balance?: number; requestId: string; authMethod: AuthMethod | null; userAgent: string | null }): Server {
+  const server = new Server(
+    { name: "novada", version: HOSTED_VERSION },
+    { capabilities: { tools: {}, prompts: {}, resources: {} } },
+  );
+
+  // B2 fix (2026-07-20, synthesis.md blocker): this filter used to be gated on
+  // `isHosted` (a VERCEL/VERCEL_ENV env-var sniff) — fail-OPEN, because those vars
+  // require an opt-in Vercel project toggle and are not guaranteed to be set. This
+  // file IS the hosted server (hosted-server/vercel/api/mcp.ts, the Vercel handler
+  // for mcp.novada.com); HOSTED_HIDDEN must be excluded unconditionally, matching
+  // the fail-CLOSED invariant already used elsewhere in this file for
+  // `listedOnHosted`/`ALL_TOOL_NAMES` above (neither of which was ever gated on
+  // isHosted) — those two silently carried the correct behavior; only this one
+  // filter, which drives the actually-served ListTools/CallTool surface, forgot it.
+  const visibleTools = (ctx.allowedTools
+    ? TOOLS.filter((t) => ctx.allowedTools!.has(t.name))
+    : TOOLS
+  ).filter(t => !HOSTED_HIDDEN.has(t.name));
+  // Names actually exposed on this endpoint — drives both ListTools and the
+  // discover catalog so an agent never sees a tool it can't call. A tool can be
+  // absent here for two reasons: filtered out by ?tools=/?groups=, or excluded by
+  // HOSTED_HIDDEN (architecturally impossible on Vercel — e.g. novada_browser_flow —
+  // or deliberately never ported — e.g. novada_site_copy, novada_ip_whitelist; see
+  // HOSTED_HIDDEN's docstring above for the full list + rationale per tool).
+  const visibleToolNames: ReadonlySet<string> = new Set(visibleTools.map((t) => t.name));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: visibleTools }));
+
+  // ── Telemetry: initialize event ───────────────────────────────────────────
+  // oninitialized fires when the `initialized` NOTIFICATION arrives.
+  // In stateless HTTP mode (sessionIdGenerator: undefined) the initialize
+  // REQUEST and the initialized NOTIFICATION are TWO separate HTTP requests —
+  // each creates a completely fresh server instance. `_clientVersion` is set
+  // inside _oninitialize (on the first request) but that server is discarded;
+  // the second request creates a brand-new server where `_clientVersion` is
+  // still undefined. Therefore server.getClientVersion() always returns
+  // undefined when oninitialized fires in stateless mode. The null-coalescing
+  // below already handles this correctly — this comment documents the why.
+  // protocol_version is not exposed via the SDK public API post-negotiation.
+  server.oninitialized = () => {
+    const cv = server.getClientVersion();
+    // hq_identity needs a FRESH nonce per row (never reused across rows, even for
+    // the same apiKey) — encryptHqIdentity is async, so it's chained here rather
+    // than passed in as an already-computed value, same pattern as scheduleToolEvent below.
+    const promise = encryptHqIdentity(apiKey).then((hq) => {
+      const initRow = buildInitializeEvent({
+        request_id: ctx.requestId,
+        token_hash: ctx.tokenHash,
+        plan: null,   // plan not resolved at initialize time
+        client_name: cv?.name ?? null,
+        client_version: cv?.version != null ? String(cv.version) : null,
+        protocol_version: null,   // not accessible via SDK public API post-negotiation
+        server_version: process.env.NOVADA_SERVER_VERSION ?? null,
+        region: process.env.VERCEL_REGION ?? null,
+        auth_method: ctx.authMethod,
+        user_agent: ctx.userAgent,
+        hq_identity: hq.hq_identity,
+        key_version: hq.key_version,
+      });
+      return emitEvent(initRow);
+    }).catch(() => { /* fail-open */ });
+    try { waitUntil(promise); } catch { /* outside Vercel context */ }
+  };
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const argsObj = (args as Record<string, unknown>) ?? {};
+    const started = Date.now();
+
+    // Telemetry helper — CAPTURE (mcp_events insert) is now AWAITED before the
+    // caller's response returns; DELIVERY (the HQ push) stays scheduled via
+    // waitUntil, unchanged. See captureEvent's doc comment above buildServer
+    // for the full root-cause writeup of this split.
+    // Falls back gracefully when called outside a Vercel context (tests, local dev).
+    const telSV = process.env.NOVADA_SERVER_VERSION ?? null;
+    const telRegion = process.env.VERCEL_REGION ?? null;
+    // Single authoritative telemetry emitter for every tool_call row in this
+    // handler. product/status_bucket/failure_class are ALWAYS derived inside
+    // buildToolCallEvent (governed, single-source functions) — never computed
+    // here — so no call site below can drift from the canonical mapping.
+    // error_code/retryable are taken from an actual thrown NovadaError (or
+    // synthesized for ZodError, the one non-NovadaError case classified here);
+    // every other guard-site rejection legitimately has no NovadaError instance
+    // and leaves both null. hq_identity needs a FRESH nonce PER ROW, so
+    // encryptHqIdentity(apiKey) is awaited fresh on every call. This is now an
+    // async function — every call site below MUST `await` it so the CAPTURE
+    // leg actually completes before the tool response returns (an un-awaited
+    // call here would silently regress back to the original bug). The ENTIRE
+    // body is wrapped in a single try/catch — matching the original
+    // fire-and-forget `.then(...).catch(() => {})` chain's whole-chain
+    // coverage. captureEvent() itself never throws, but encryptHqIdentity/
+    // buildToolCallEvent run BEFORE it and are not individually guarded — this
+    // function must be AT LEAST as fail-open as the code it replaced.
+    const scheduleToolEvent = async (opts: {
+      outcome: string;
+      gate: { charged: boolean; over_cap_allowed: boolean; quota_remaining: number };
+      plan: string | null;
+      rejectionStage?: RejectionStage;
+      isHostedLimitation?: boolean;
+      gatewayCeilingHit?: boolean;
+      error?: unknown;
+    }): Promise<void> => {
+      try {
+        const novadaErr = opts.error instanceof NovadaError ? opts.error : null;
+        const isZod = opts.error instanceof ZodError;
+        const errorCode = novadaErr ? novadaErr.code : (isZod ? NovadaErrorCode.INVALID_PARAMS : null);
+        const retryable = novadaErr ? novadaErr.retryable : (isZod ? false : null);
+        const hq = await encryptHqIdentity(apiKey);
+        const row = buildToolCallEvent({
+          request_id: ctx.requestId,
+          token_hash: ctx.tokenHash,
+          plan: opts.plan,
+          client_name: null,   // stateless: new server per request, getClientVersion() is not set for tool calls
+          client_version: null,
+          protocol_version: null,
+          tool: name,
+          args: argsObj,
+          outcome: opts.outcome,
+          latency_ms: Date.now() - started,
+          charged: opts.gate.charged,
+          over_cap_allowed: opts.gate.over_cap_allowed,
+          quota_remaining: opts.gate.quota_remaining,
+          server_version: telSV,
+          region: telRegion,
+          error_code: errorCode,
+          retryable,
+          rejection_stage: opts.rejectionStage,
+          is_hosted_limitation: opts.isHostedLimitation,
+          gateway_ceiling_hit: opts.gatewayCeilingHit,
+          auth_method: ctx.authMethod,
+          user_agent: ctx.userAgent,
+          hq_identity: hq.hq_identity,
+          key_version: hq.key_version,
+        });
+        // CAPTURE — durable, awaited (see captureEvent doc comment).
+        await captureEvent(row);
+        // DELIVERY — best-effort, unchanged timing. `started` = the tool call's
+        // own start timestamp — Leo's contract wants EVENT time (事件发生时间), not
+        // push time; the emit hop + retries can lag tens of seconds on slow tools.
+        // pushToHq never throws (see ./_hq_push.ts) — no .catch() needed here.
+        try { waitUntil(pushToHq(row, process.env, started)); } catch { /* outside Vercel context */ }
+      } catch (err) {
+        // Fail-open, matching the original code's whole-chain
+        // `.catch(() => {})` — a row could not even be BUILT (nothing for
+        // captureEvent's own fallback to retry), so this is a distinct,
+        // coarser degradation than captureEvent's internal capture_degraded log.
+        console.error(JSON.stringify({
+          evt: "capture_degraded",
+          request_id: ctx.requestId,
+          tool: name,
+          msg: "scheduleToolEvent threw before a row could be built — telemetry row dropped, tool response unaffected",
+          error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+        }));
+      }
+    };
+
+    // Tool-set filter: reject tools not in the endpoint's ?tools=/?groups= selection.
+    // This is a CALLER config choice (their own URL params), not a hosted
+    // architectural limitation — is_hosted_limitation stays false.
+    if (ctx.allowedTools && !ctx.allowedTools.has(name) && !HOSTED_HIDDEN_ALIASES.has(name)) {
+      await scheduleToolEvent({
+        outcome: "TOOL_NOT_ENABLED",
+        gate: { charged: false, over_cap_allowed: false, quota_remaining: 0 },
+        plan: null,
+        rejectionStage: "tool_filtered",
+        isHostedLimitation: false,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Error [TOOL_NOT_ENABLED]: '${name}' is not enabled on this endpoint. It was filtered out by the ?tools=/?groups= URL parameter.\nagent_instruction: Remove the filter from the MCP URL, or add this tool/group to it, to use ${name}.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Hidden / unwired-on-hosted guard: a tool that isn't in the visible set for this
+    // endpoint (a HOSTED_HIDDEN tool such as novada_browser_flow / novada_site_copy /
+    // novada_ip_whitelist, or an outright unknown name) is rejected BEFORE quota is
+    // touched, with an agent_instruction pointing at the npm package where the full
+    // tool surface is available. This IS a hosted architectural limitation —
+    // is_hosted_limitation is true.
+    if (!visibleToolNames.has(name) && !HOSTED_HIDDEN_ALIASES.has(name)) {
+      await scheduleToolEvent({
+        outcome: "TOOL_NOT_ENABLED",
+        gate: { charged: false, over_cap_allowed: false, quota_remaining: 0 },
+        plan: null,
+        rejectionStage: "tool_filtered",
+        isHostedLimitation: true,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Error [TOOL_NOT_ENABLED]: '${name}' is not available on the hosted Novada MCP endpoint.\nagent_instruction: Install the local MCP server to use ${name} — \`npx novada-mcp\` (npm package "novada-mcp") with your own NOVADA_API_KEY exposes the full tool surface, including browser automation and disk-writing tools. All other Novada tools (search/extract/crawl/map/research/scrape/verify/proxy/account) work on the hosted endpoint.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // novada_setup is auth-free and never charged against quota.
+    if (name === "novada_setup") {
+      // SETUP_GATE semantics: charged=false, over_cap_allowed=false, quota_remaining=0.
+      // plan=null (not resolved on the setup path). token_hash from ctx (always present
+      // — the auth guard at the top already validated the token; if somehow absent the
+      // emitEvent call is a no-op).
+      const setupGateFields = { charged: false, over_cap_allowed: false, quota_remaining: 0 };
+      try {
+        // Pass the caller's token so setup validates the CUSTOMER's key (not the server env fallback).
+        const result = await novadaSetup(validateSetupParams(argsObj), ctx.token);
+        logUsage(env, ctx.token, name, true, Date.now() - started);
+        // SETUP_GATE is the exempt sentinel — novada_setup exits before the real gate is evaluated.
+        // monthlyQuota is declared below (after this early-return block) — inline it here.
+        const setupMonthlyQuota = parseInt(env.FREE_PLAN_MONTHLY_QUOTA || "1000", 10);
+        const setupFooter = buildStatusFooter(SETUP_GATE, setupMonthlyQuota);
+        await scheduleToolEvent({ outcome: "ok", gate: setupGateFields, plan: null });
+        return { content: [{ type: "text" as const, text: result + setupFooter }] };
+      } catch (e) {
+        logUsage(env, ctx.token, name, false, Date.now() - started);
+        await scheduleToolEvent({ outcome: "error", gate: setupGateFields, plan: null, error: e });
+        return { content: [{ type: "text" as const, text: String(e) }], isError: true };
+      }
+    }
+
+    // Gateway cap gate (P0 paid-tier fix, PRD 2026-07-13). Quota is still charged
+    // BEFORE the call so abusive loops can't burn free credits, but:
+    //   • CAP_EXEMPT_TOOLS (setup/discover/account family) are never counted and
+    //     never blocked — a cap-exhausted key can always self-diagnose.
+    //   • An approval-gate PREVIEW call (no approval_token on a gated tool/action —
+    //     see isApprovalGatePreviewCall in ./_plan.ts) is also never counted: it
+    //     does zero upstream work, only the matching EXECUTE call is charged.
+    //   • Over the cap, paid accounts pass: orders-derived plan is the primary
+    //     signal (lazily resolved, KV-cached), positive balance the OR-fallback
+    //     (reusing the balance validateToken already fetched when available).
+    //   • Keys under the cap incur ZERO plan lookups (lazy trigger; pre-warm
+    //     fires asynchronously past PREFETCH_THRESHOLD).
+    const monthlyQuota = parseInt(env.FREE_PLAN_MONTHLY_QUOTA || "1000", 10);
+    const gate = await enforceGatewayCap({
+      toolName: name,
+      monthlyQuota,
+      ctxBalance: ctx.balance,
+      // MEDIUM fix (2026-09 audit, ADVERSARIAL-INTEGRATION.md): argsObj lets
+      // enforceGatewayCap detect an approval-gate PREVIEW call (no
+      // approval_token on a gated tool/action) and skip charging it — see
+      // isApprovalGatePreviewCall in ./_plan.ts. Without this, one logical
+      // write (proxy_account_create etc.) cost 2 quota units and a caller
+      // with exactly 1 unit left could get an approved-but-unexecutable write.
+      args: argsObj,
+      deps: {
+        decrementQuota: (plan) => decrementQuota(ctx.tokenHash, env, plan),
+        resolvePlan: () => resolvePlan(apiKey, ctx.tokenHash),
+        // 2026-07-30 incident fix: the wallet ledger alone missed capture-funded
+        // paid accounts (Scraping Solutions: wallet=$0, capture balance ~$99,994.78).
+        // fetchAggregateBalance queries BOTH ledgers in parallel and never throws —
+        // see ./_plan.ts for the per-ledger degrade-to-0 + max() contract.
+        fetchBalance: () => fetchAggregateBalance({
+          fetchWalletBalance: () => devApiPost("/v1/wallet/balance", {}, { apiKey, timeoutMs: TOKEN_VERIFY_TIMEOUT_MS }),
+          fetchCaptureBalance: () => devApiPost("/v1/capture/get_balance", {}, { apiKey, timeoutMs: TOKEN_VERIFY_TIMEOUT_MS }),
+        }),
+      },
+    });
+    if (!gate.allowed) {
+      await scheduleToolEvent({
+        outcome: "cap_blocked",
+        gate: { charged: false, over_cap_allowed: false, quota_remaining: -1 },
+        plan: "free",
+        rejectionStage: "cap_blocked",
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: [
+            "## Free Gateway Cap Reached",
+            "",
+            `This hosted gateway allows ${monthlyQuota} free calls/month per API key. Your key has used them up — and has no payment history and no remaining balance, so the paid exemption does not apply.`,
+            "",
+            "**Options:**",
+            "1. The free-gateway cap resets at the start of next month — or run a local MCP server now (no monthly gateway cap): `npx novada-mcp@latest` with the same API key (calls still draw your Novada balance).",
+            "2. Top up at https://dashboard.novada.com/ — a positive balance takes effect on your NEXT call (balance is checked live when you're over the cap); purchase-history classification may take up to ~6 hours.",
+            "3. Need a higher gateway cap? Contact sales@novada.com.",
+            "",
+            "agent_instruction: free_gateway_cap_reached | retry_recommended: false (unless the user just topped up — then retry immediately; live balance check applies) | resets: start_of_next_month | alternatives: run local MCP via `npx novada-mcp@latest` (same key, no gateway cap) OR top up at https://dashboard.novada.com/ (positive balance exempts on the next call; purchase-history classification within ~6h) OR wait for monthly reset.",
+          ].join("\n"),
+        }],
+        isError: true,
+      };
+    }
+    const remaining = gate.remaining;
+
+    // Browser caller-key billing (TOW2-249 CHALLENGE): core.dispatch calls novadaBrowser
+    // WITHOUT the apiKey arg, and resolveBrowserWs reads store.browserWs / NOVADA_BROWSER_WS
+    // but NOT store.apiKey — so with the server NOVADA_API_KEY stripped, an unprovisioned
+    // browser call would resolve to null ("Not Configured") instead of billing the caller.
+    // Pre-resolve the caller's Browser WSS here (auto-fetch via THEIR key, product=10;
+    // tenant-safe per-key cache) and seed it into the store so novadaBrowser uses it. If the
+    // caller has no Browser entitlement this stays undefined and the tool returns its own
+    // "Not Configured" message — no server-account fallback either way.
+    let browserWs: string | undefined;
+    if (name === "novada_browser") {
+      // Bound the auto-provision round-trip: it runs BEFORE the withWallClock guard,
+      // so a hung management API could otherwise push total latency toward the 60s
+      // Vercel function limit. 4s cap → null → the tool emits its own "Not Configured".
+      browserWs = (await Promise.race([
+        resolveBrowserWs(apiKey).catch(() => null),
+        new Promise<null>((r) => setTimeout(() => r(null), 4000)),
+      ])) ?? undefined;
+    }
+
+    // Wrap the whole dispatch so the caller's apiKey populates the AsyncLocalStorage
+    // credential store for every store-reading resolver underneath (Web Unblocker / proxy /
+    // browser). store.run() transparently propagates the inner return values and rejections.
+    return await withCredentials({ apiKey, browserWs }, async () => {
+    try {
+
+      // ── Browser-flow explicit refusal (BEFORE dispatch — no quota burned for it) ──
+      // novada_browser_flow keeps a persistent WS session across multiple tool calls;
+      // Vercel serverless isolates cannot hold that state. Early-exit + refund (NOV-578).
+      if (name === "novada_browser_flow") {
+        logUsage(env, ctx.token, name, false, Date.now() - started);
+        if (gate.charged) await refundQuota(ctx.tokenHash, env);
+        await scheduleToolEvent({
+          outcome: "NOT_AVAILABLE_ON_HOSTED",
+          gate: { charged: gate.charged, over_cap_allowed: gate.overCapAllowed, quota_remaining: gate.remaining },
+          plan: gate.overCapAllowed ? "pro" : "free",
+          rejectionStage: "tool_filtered",
+          isHostedLimitation: true,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Error [NOT_AVAILABLE_ON_HOSTED]: novada_browser_flow requires a persistent WebSocket session that Vercel serverless isolates cannot hold.\nagent_instruction: Use the local MCP server (`npx novada-mcp`) for browser-flow tasks, or use novada_scrape / novada_extract for static-content extraction on the hosted server.",
+          }],
+          isError: true,
+        };
+      }
+
+      // ── novada_discover override — scope catalog to this endpoint's visible tools ──
+      // core.dispatch calls novadaDiscover(args) without the second arg, which would list
+      // core's full registered catalog. On hosted we pass visibleToolNames so the output
+      // only advertises the tools the agent can actually call on this endpoint (core's
+      // catalog minus HOSTED_HIDDEN, further narrowed by any ?tools=/?groups= filter).
+      if (name === "novada_discover") {
+        const result = await novadaDiscover(validateDiscoverParams(argsObj), visibleToolNames);
+        logUsage(env, ctx.token, name, true, Date.now() - started);
+        const sanitized = sanitizeHostedOutput(result);
+        const discoverFooter = buildStatusFooter(gate, monthlyQuota);
+        // TOW2-242: first-run notice on this successful path too (separate block).
+        const discoverContent = [{ type: "text" as const, text: sanitized + discoverFooter }];
+        const discoverNotice = await maybeGetFirstRunNoticeHosted(ctx.token);
+        if (discoverNotice) discoverContent.push({ type: "text" as const, text: discoverNotice });
+        await scheduleToolEvent({
+          outcome: "ok",
+          gate: { charged: gate.charged, over_cap_allowed: gate.overCapAllowed, quota_remaining: gate.remaining },
+          plan: gate.overCapAllowed ? "pro" : "free",
+        });
+        return { content: discoverContent };
+      }
+
+      // ── Single dispatch call (replaces the old hand-maintained switch) ──
+      // core.dispatch handles routing for every npm-registered tool (see CORE_TOOLS,
+      // derived from core.ts's TOOLS) plus core's HIDDEN_ALIASES (backward-compat names).
+      // It throws Error("Unknown tool: <name>") for anything not in its switch.
+      // withWallClock races the Promise against the 56s wall-clock budget.
+      const result = await withWallClock(
+        name,
+        // TOW2-240: pass visibleToolNames so dispatch can suppress agent_instructions
+        // that reference tools absent from this endpoint (e.g. novada_search_feedback).
+        dispatch(name, argsObj, apiKey, { onProgress: undefined, visibleTools: visibleToolNames }),
+      );
+
+      logUsage(env, ctx.token, name, true, Date.now() - started);
+      const sanitized = sanitizeHostedOutput(result);
+      // Truthful status footer — every successful response carries exactly ONE line:
+      //   free-plan under cap → "⚠ gateway: N/M free calls remaining this month · cost: unknown…"
+      //   paid/uncapped        → "gateway: uncapped (paid account) · cost: unknown…"
+      //   cap-exempt meta tool → "gateway: free call — no quota consumed"
+      // The 20%-threshold suppression is gone: the footer is always present so agents
+      // and users always see their access regime (cost-visibility invariant, Phase D).
+      const statusFooter = buildStatusFooter(gate, monthlyQuota);
+      // TOW2-242: one-time first-run notice — SEPARATE content block (never
+      // concatenated into the result text, which would corrupt JSON outputs),
+      // ONLY on this successful path. Fails quiet → never throws.
+      const content = [{ type: "text" as const, text: sanitized + statusFooter }];
+      const notice = await maybeGetFirstRunNoticeHosted(ctx.token);
+      if (notice) content.push({ type: "text" as const, text: notice });
+      // Classify in-band ceiling timeout from extractSingle — returned as a string
+      // starting with "## Extraction Error" (not thrown), so it reaches this success
+      // path. Emitting "ok" for a timed-out request is misleading in telemetry.
+      const isCeilingTimeout = typeof result === "string" && result.startsWith("## Extraction Error");
+      await scheduleToolEvent({
+        outcome: isCeilingTimeout ? "TIMEOUT" : "ok",
+        gate: { charged: gate.charged, over_cap_allowed: gate.overCapAllowed, quota_remaining: gate.remaining },
+        plan: gate.overCapAllowed ? "pro" : "free",
+      });
+      return {
+        content,
+        // quota_remaining only for real free-plan charges: exempt tools were
+        // never charged, and an over-cap-exempted (paid) call would report a
+        // misleading 0 — paid accounts aren't bound by the cap.
+        ...(gate.charged && !gate.overCapAllowed ? { _meta: { quota_remaining: remaining } } : {}),
+      };
+    } catch (error) {
+      // Alert-gating (noise reduction): handled transient/user errors record a
+      // breadcrumb for forensics; only likely-bug errors fire an actual alert.
+      // The customer response, redaction, 500-char cap, logUsage and refundQuota
+      // below are UNCHANGED — this gates the Sentry side-effect only.
+      if (shouldAlertSentry(error)) {
+        Sentry.withScope(scope => {
+          scope.setTag("tool", name);
+          Sentry.captureException(error);
+        });
+        await sentryFlush();
+      } else {
+        const code = error instanceof NovadaError ? error.code : undefined;
+        Sentry.addBreadcrumb({
+          category: "tool-handled",
+          level: "info",
+          message: `${name}: ${code ?? (error instanceof Error ? error.name : "error")}`,
+          data: {
+            tool: name,
+            code,
+            retryable: error instanceof NovadaError ? error.retryable : undefined,
+          },
+        });
+        // no captureException, no alert — breadcrumb rides along on the next real event
+      }
+      logUsage(env, ctx.token, name, false, Date.now() - started);
+      // The tool failed (validation / upstream / transport) → no useful work done, so
+      // refund the quota decremented before the call. Failed calls must not burn customer
+      // credits (NOV-578). refundQuota is best-effort and swallows its own errors.
+      // Guarded by gate.charged: cap-exempt tools were never charged — an
+      // unconditional refund here would walk their counter DOWN and mint free calls.
+      if (gate.charged) await refundQuota(ctx.tokenHash, env);
+      // Telemetry: error outcome with the NovadaError code, or generic "error".
+      // gatewayCeilingHit distinguishes withWallClock's OWN timeout from a genuine
+      // upstream TASK_PENDING — both share the same NovadaErrorCode (see the
+      // GATEWAY_CEILING_ERRORS WeakSet doc comment above withWallClock).
+      const gatewayCeilingHit = error instanceof NovadaError && GATEWAY_CEILING_ERRORS.has(error);
+      await scheduleToolEvent({
+        outcome: error instanceof NovadaError ? error.code : (error instanceof ZodError ? "INVALID_PARAMS" : "error"),
+        gate: { charged: gate.charged, over_cap_allowed: gate.overCapAllowed, quota_remaining: gate.remaining },
+        plan: gate.overCapAllowed ? "pro" : "free",
+        gatewayCeilingHit,
+        error,
+      });
+      if (error instanceof ZodError) {
+        const issues = error.issues.map((i) => `  ${i.path.join(".")}: ${i.message}`).join("\n");
+        return {
+          content: [{ type: "text" as const, text: `Validation failed for ${name}:\n${issues}\n\nagent_instruction: Check the tool's inputSchema for required fields and valid types. Call list_tools to see the schema for ${name}.` }],
+          isError: true,
+        };
+      }
+      // NovadaError carries a tailored agent_instruction / failure_class / retry hint —
+      // preserve it (npm-parity). Only fall through to the hosted substring hints
+      // below for non-NovadaError errors. (NOV-571: the hosted endpoint was dropping all of
+      // this and returning a bare truncated message.)
+      // #2-hosted: the vendored errors.js (0.8.2-dev) does NOT redact inside
+      // toAgentString(), so a NovadaError whose .message interpolates upstream text
+      // (e.g. classifyError's "Domain unreachable: <raw>" on the render path) can carry
+      // `user:pass@host` or an internal *.novada.com host. Route it through the hosted
+      // redactor here — toAgentString()'s newline-collapse keeps the credential on one
+      // line, so the userinfo/host rules still match.
+      if (error instanceof NovadaError) {
+        return {
+          content: [{ type: "text" as const, text: redactHostedSecrets(error.toAgentString()) }],
+          isError: true,
+        };
+      }
+      // Hosted-aware error wrapping — translate internal errors to actionable guidance.
+      // #2-hosted: redact credentials / internal hosts from the raw upstream message
+      // BEFORE it touches any branch, so neither the substring match nor the sliced
+      // fallback can leak `user:pass@host` or an internal *.novada.com host.
+      const rawMsg = redactHostedSecrets(error instanceof Error ? error.message : String(error));
+      let userMsg = rawMsg;
+
+      // Common hosted failure: NOVADA_WEB_UNBLOCKER_KEY not set → extract render fails
+      if (rawMsg.includes("NOVADA_WEB_UNBLOCKER_KEY") || rawMsg.includes("UNBLOCKER_NOT_CONFIGURED")) {
+        userMsg = `Extract JS rendering is not configured on this hosted endpoint. The tool attempted static extraction only. For JS-heavy pages, use a local MCP server with NOVADA_WEB_UNBLOCKER_KEY configured, or try novada_scrape for platform-specific data.`;
+      }
+      // Proxy not configured
+      else if (rawMsg.includes("PROXY_AUTH_FAILURE") || rawMsg.includes("proxy credentials not configured")) {
+        userMsg = `Proxy credentials are not available on this hosted endpoint. For web extraction, use novada_extract or novada_crawl instead — they handle proxies internally.`;
+      }
+      // Browser not available
+      else if (rawMsg.includes("NOT_AVAILABLE_ON_HOSTED") || rawMsg.includes("Playwright")) {
+        userMsg = `This tool requires a local MCP server. Install via: npx novada-mcp`;
+      }
+      // Fallback: don't leak raw internals (stack traces, file paths, API response bodies)
+      else {
+        userMsg = `Tool error: ${rawMsg.slice(0, 200)}`;
+      }
+      // Defense in depth: redact again after assembly (the static templates are clean,
+      // but a future edit that interpolates rawMsg shouldn't be able to leak).
+      userMsg = redactHostedSecrets(userMsg);
+      // Cap total length
+      if (userMsg.length > 500) {
+        userMsg = userMsg.slice(0, 497) + "...";
+      }
+
+      return {
+        content: [{ type: "text" as const, text: userMsg }],
+        isError: true,
+      };
+    }
+    }); // end withCredentials
+  });
+
+  // MCP prompts — list + get, delegated to the vendored prompts module (npm parity).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  server.setRequestHandler(ListPromptsRequestSchema, async () => listPrompts() as any);
+  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return getPrompt(name, (args as Record<string, string>) || {}) as any;
+  });
+
+  // MCP resources — zero quota (catalog/self-diagnosis data must never be gated).
+  // Reuses the vendored listResources / readResource implementations from the npm
+  // package — same content the stdio server exposes, 1:1 parity.
+  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return listResources() as any;
+  });
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const { uri } = request.params;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return readResource(uri) as any;
+    } catch (err) {
+      // Convert "Unknown resource URI" from readResource into a JSON-RPC error by
+      // THROWING McpError — returning an error-shaped object would be serialised as a
+      // successful result.  The MCP SDK only produces a JSON-RPC error response when
+      // the handler throws; -32602 InvalidParams is accurate for an unknown URI.
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new McpError(ErrorCode.InvalidParams, msg);
+    }
+  });
+
+  return server;
+}
+
+// ─── HTTP entrypoint ─────────────────────────────────────────────────────────
+/**
+ * RFC 9728 §5.1: every 401 on the protected /mcp resource must point OAuth-aware
+ * clients (Claude.ai, mcp-remote) at Protected Resource Metadata discovery via
+ * `resource_metadata=` on the WWW-Authenticate challenge, so they can find the
+ * Authorization Server and start the OAuth flow instead of just failing.
+ */
+function resourceMetadataUrl(url: URL): string {
+  return `${deriveIssuer(url.host, process.env.OAUTH_ISSUER)}/.well-known/oauth-protected-resource/mcp`;
+}
+
+function jsonError(status: number, code: string, message: string, agentInstruction?: string, extraHeaders?: Record<string, string>): Response {
+  return new Response(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: {
+        code: status,
+        message,
+        data: { code, agent_instruction: agentInstruction },
+      },
+      id: null,
+    }),
+    { status, headers: { "content-type": "application/json", ...extraHeaders } },
+  );
+}
+
+/**
+ * Extract the client IP for rate-limit identity. MUST use a Vercel-trusted
+ * header — `x-vercel-forwarded-for` (set by Vercel's proxy) or `x-real-ip`.
+ * Raw `x-forwarded-for` is client-spoofable (an attacker can forge a fresh IP
+ * per request to defeat the per-IP limit), so it is NEVER trusted here.
+ * Falls back to "unknown" — rate limit is then skipped.
+ */
+function getClientIp(request: Request): string {
+  const vff = request.headers.get("x-vercel-forwarded-for");
+  if (vff) {
+    const first = vff.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  const xri = request.headers.get("x-real-ip");
+  if (xri) return xri.trim();
+  return "unknown";
+}
+
+// ─── Vercel Node runtime adapter ─────────────────────────────────────────────
+// Vercel's Node.js Functions runtime invokes handlers with Node's native
+// IncomingMessage / ServerResponse — NOT Fetch API Request/Response. But the
+// MCP-handler code below was written against Fetch API (request.headers.get(),
+// new Response(...)). To keep that body working on Node, the default export is
+// a Node-style wrapper that adapts Node req/res ↔ Fetch Request/Response.
+//
+// If we ever switch to runtime: "edge" (or Fluid Compute's web-style handler),
+// drop the adapter and rename `fetchHandler` → default export.
+
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+interface NodeCtx {
+  req: IncomingMessage;
+  res: ServerResponse;
+  parsedBody?: unknown;
+}
+
+// NOV-578 #10: hard ceiling on request-body buffering. 4 MB is generous for JSON-RPC /
+// tool arguments and aligns with Vercel's own serverless payload limit.
+const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
+
+async function readNodeBody(req: IncomingMessage): Promise<Buffer | undefined> {
+  const method = (req.method || "GET").toUpperCase();
+  if (["GET", "HEAD"].includes(method)) return undefined;
+  // NOV-578 #10: this runs BEFORE auth — without a ceiling an unauthenticated client could
+  // stream an unbounded body and exhaust function memory (pre-auth memory DoS). Reject early
+  // on a declared content-length, and enforce a running-total backstop against a lying/absent one.
+  const declared = Number(req.headers["content-length"]);
+  if (Number.isFinite(declared) && declared > MAX_REQUEST_BODY_BYTES) {
+    throw Object.assign(new Error("Request body exceeds the 4 MB limit."), { statusCode: 413 });
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req as AsyncIterable<Buffer>) {
+    total += chunk.length;
+    if (total > MAX_REQUEST_BODY_BYTES) {
+      throw Object.assign(new Error("Request body exceeds the 4 MB limit."), { statusCode: 413 });
+    }
+    chunks.push(chunk);
+  }
+  return chunks.length ? Buffer.concat(chunks) : undefined;
+}
+
+function nodeReqToWebReq(req: IncomingMessage, rawBody: Buffer | undefined): Request {
+  const host = (req.headers.host as string) || "localhost";
+  const url = `https://${host}${req.url || "/"}`;
+  const method = (req.method || "GET").toUpperCase();
+
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (Array.isArray(v)) v.forEach(vv => headers.append(k, vv));
+    else if (typeof v === "string") headers.set(k, v);
+  }
+
+  // Buffer is a Uint8Array under the hood; cast to satisfy BodyInit typing.
+  const body = rawBody ? new Uint8Array(rawBody) : undefined;
+  return new Request(url, { method, headers, body });
+}
+
+async function sendWebRes(res: ServerResponse, webRes: Response): Promise<void> {
+  res.statusCode = webRes.status;
+  webRes.headers.forEach((v, k) => res.setHeader(k, v));
+  const text = await webRes.text();
+  res.end(text);
+}
+
+export default async function nodeHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    // Read body once — pass to both the Fetch shim (for pre-transport logic)
+    // and the MCP SDK transport (which would otherwise re-read the stream).
+    const rawBody = await readNodeBody(req);
+    let parsedBody: unknown;
+    if (rawBody) {
+      const text = rawBody.toString("utf8");
+      try { parsedBody = JSON.parse(text); } catch { /* leave undefined */ }
+    }
+
+    const webReq = nodeReqToWebReq(req, rawBody);
+    const webRes = await fetchHandler(webReq, { req, res, parsedBody });
+
+    // If the MCP transport already wrote to res (Node-style dispatch), skip
+    // re-sending. The transport sets res.headersSent after its first write.
+    if (!res.headersSent) {
+      await sendWebRes(res, webRes);
+    }
+  } catch (err) {
+    if (!res.headersSent) {
+      // NOV-578 #10: surface an oversized body as 413 (not a generic 500) so the client
+      // gets an actionable signal.
+      const statusCode = (err as { statusCode?: number } | null)?.statusCode;
+      if (statusCode === 413) {
+        res.statusCode = 413;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({
+          error: "PAYLOAD_TOO_LARGE",
+          message: "Request body exceeds the 4 MB limit. Reduce payload size or split large tool arguments.",
+        }));
+        return;
+      }
+      // Log full error server-side but don't leak internals to client
+      Sentry.captureException(err);
+      await sentryFlush();
+      console.error("[nodeHandler] Internal error:", (err as Error)?.message ?? String(err));
+      res.statusCode = 500;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({
+        error: "INTERNAL_ERROR",
+        message: "An internal error occurred. Please try again or contact support.",
+      }));
+    }
+  }
+}
+
+// ─── Original Fetch-API handler (called by the Node adapter above) ───────────
+async function fetchHandler(request: Request, nodeCtx?: NodeCtx): Promise<Response> {
+  const env = readEnv();
+  // Vercel Node.js Functions: request.url is path-only ("/mcp"). Vercel Edge:
+  // absolute URL. Provide a base so URL parsing works in both runtimes.
+  const base = `https://${request.headers.get("host") || "localhost"}`;
+  const url = new URL(request.url, base);
+
+  // Vercel rewrites /mcp -> /api/mcp, so both pathnames must be accepted here.
+  // Path-based auth: /:key/mcp is also valid (Firecrawl pattern for Claude.ai).
+  // We also expose a health probe on /health for ops.
+  const pathname = url.pathname;
+
+  if (pathname === "/") {
+    return new Response(
+      JSON.stringify({
+        name: "Novada MCP",
+        endpoint: "https://mcp.novada.com/mcp",
+        documentation_url: "https://novada.com/products/novada-mcp/",
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
+  }
+
+  if (pathname === "/health" || pathname === "/api/health") {
+    return new Response(JSON.stringify({ ok: true, service: "novada-mcp-hosted", endpoint: "/mcp" }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // OAuth 2.1 endpoints (RFC 8414/9728/7591/6749/7636) — routed BEFORE the
+  // /mcp path check and 404 fallback. Metadata GETs work without KV/env; the
+  // grant endpoints (/register, /authorize, /token) fail closed to
+  // server_error when OAUTH_ENC_KEY is absent (see _oauth.ts).
+  if (isOAuthPath(pathname)) {
+    return handleOAuthRequest(request, url, getClientIp(request), buildOAuthDeps(env));
+  }
+
+  // Accept /mcp, /api/mcp, or /:key/mcp (path-based auth for Claude.ai).
+  // In Vercel Node runtime, req.url may show the original path even after rewrite.
+  const pathMatch = pathname.match(/^\/([a-zA-Z0-9_\-]{16,})\/mcp$/);
+  const isMcpPath = pathname === "/mcp" || pathname === "/api/mcp" || !!pathMatch;
+
+  if (!isMcpPath) {
+    return jsonError(404, "NOT_FOUND", "Unknown path. The MCP endpoint is POST/GET /mcp.");
+  }
+
+  // 🔴 STUB AUTH GATE — operator must explicitly accept that the auth layer is a stub
+  // until sub2api integration lands. See PRE_LAUNCH_CHECKLIST.md.
+  // Scope: this gate covers /mcp ONLY. The OAuth AS endpoints (.well-known/*,
+  // /register, /authorize, /token) route above it — metadata GETs are pure, and
+  // grant endpoints fail closed to server_error while OAUTH_ENC_KEY is unset, so
+  // leaving this env var off does NOT dark-launch the whole host.
+  if (env.STUB_AUTH_WARNING_ACCEPTED !== "true") {
+    return jsonError(503, "STUB_AUTH_UNACKED",
+      "Auth system not yet activated. Contact the operator.",
+      "Operator: set env STUB_AUTH_WARNING_ACCEPTED=true via `vercel env add STUB_AUTH_WARNING_ACCEPTED production` and redeploy.");
+  }
+
+  // KV connection check — must be explicit. Vercel auto-injects KV_REST_API_URL +
+  // KV_REST_API_TOKEN when a KV store is connected to the project. If they're
+  // missing, fail loud rather than silently bypassing rate-limit + quota.
+  if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) {
+    return jsonError(500, "KV_NOT_CONFIGURED",
+      "Vercel KV store is not connected to this project. KV_REST_API_URL and KV_REST_API_TOKEN are required.",
+      "Operator: create a KV store in the Vercel dashboard (Storage → Create → KV), connect it to this project, then redeploy.");
+  }
+
+  // CORS preflight (some MCP clients probe with OPTIONS). Preflight carries no
+  // auth header, so it must short-circuit before the token check below.
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, POST, OPTIONS",
+        "access-control-allow-headers": "content-type, authorization, mcp-session-id",
+        "access-control-max-age": "86400",
+      },
+    });
+  }
+
+  // Stable per-request identifier for telemetry correlation. Generated BEFORE
+  // auth so every guard-site rejection below (pre_auth / rate_limited) can be
+  // emitted with the SAME request_id a successful call would have gotten.
+  // Never logged in user-visible output — used only in the mcp_events sink.
+  const requestId = crypto.randomUUID();
+  // Raw User-Agent header — sanitized (truncated + control-stripped) inside
+  // buildToolCallEvent/buildInitializeEvent, never here. Never paired with raw
+  // IP in telemetry (see the roundtable doc §4 privacy redline).
+  const userAgent = request.headers.get("user-agent");
+
+  // G-5 / V2-N4: cheap per-IP PRE-AUTH gate — resolved and checked BEFORE
+  // token extraction, BEFORE validateToken's KV read + live upstream probe,
+  // and BEFORE every emitGuardRejection telemetry emit below. Without this, a
+  // client sending unlimited unique format-valid dummy keys from one IP could
+  // burn one upstream wallet-balance probe + one telemetry emit per request,
+  // completely unmetered — the post-auth rateLimitExceeded() further down
+  // never even sees the request because auth rejects it first. `ip` is
+  // resolved here (rather than just before the post-auth limiter, as before)
+  // specifically so this gate can run first; the post-auth limiter reuses the
+  // same value further down instead of re-resolving it.
+  const ip = getClientIp(request);
+  if (await preAuthRateLimitExceeded(ip, env)) {
+    return jsonError(429, "RATE_LIMITED",
+      `Too many requests from your IP. Limit is ${env.RATE_LIMIT_PER_MIN || "60"} requests/minute.`,
+      "Retry after 60 seconds. If you need higher limits, contact sales@novada.com.",
+      { "retry-after": "60" });
+  }
+
+  // Auth — validate the token and reject with 401 before any per-key work
+  // (dispatch, quota, upstream calls). The cheap per-IP counter above is the
+  // only KV op allowed to run ahead of this; validateToken's own KV read +
+  // live upstream probe still runs after it, bounded by that counter.
+  // `token` is `let`-bound and REBOUND (never renamed) once an OAuth access
+  // token resolves to the caller's real Novada key below — every downstream
+  // consumer (validateToken, tokenHash, buildServer, the `apiKey` trim further
+  // down) must see that real key, and caller-key.test.mjs's
+  // `const apiKey = token?.trim()` fence depends on this same carrier.
+  let token = extractToken(request)?.token ?? null;
+  const authMethod = extractToken(request)?.authMethod ?? null;
+  if (!token) {
+    // pre_auth guard-site emit: no token at all → no tokenHash/hq_identity possible
+    // (nothing to hash or encrypt) — emitGuardRejection handles that null case.
+    await emitGuardRejection({ requestId, token: null, outcome: "MISSING_TOKEN", rejectionStage: "pre_auth", authMethod, userAgent });
+    // The RFC 9728 challenge header below is written INLINE at each 401 site on
+    // purpose: oauth.test.mjs T28 counts the literal per site. Consolidating these
+    // 401 responses into a shared helper breaks that contract test — update the
+    // test first if you ever refactor this.
+    return jsonError(401, "MISSING_TOKEN",
+      "Missing API key. Pass your own Novada API key as ?apikey=YOUR_KEY or Authorization: Bearer YOUR_KEY — the hosted endpoint bills each call to your own Novada balance.",
+      "Get a Novada API key with $10 free credits at https://novada.com — then use it as the apikey in your MCP URL.",
+      { "www-authenticate": `Bearer resource_metadata="${resourceMetadataUrl(url)}"` });
+  }
+
+  // OAuth access tokens (nvo_at_*, minted by POST /token) are opaque handles —
+  // resolve to the underlying Novada API key BEFORE validateToken (which only
+  // understands real Novada keys), so a raw key and a resolved OAuth key take
+  // the exact same path from here on.
+  if (token.startsWith("nvo_at_")) {
+    const resolved = await resolveAccessToken(token, buildOAuthDeps(env));
+    if (!resolved) {
+      await emitGuardRejection({ requestId, token, outcome: "INVALID_TOKEN", rejectionStage: "pre_auth", authMethod, userAgent });
+      return jsonError(401, "INVALID_TOKEN",
+        "This OAuth access token is expired, revoked, or unknown.",
+        "Refresh via grant_type=refresh_token, or restart the OAuth flow at /.well-known/oauth-authorization-server.",
+        { "www-authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl(url)}"` });
+    }
+    token = resolved;
+  }
+
+  const info = await validateToken(token, env);
+  if (!info.valid) {
+    // `verified` distinguishes a real upstream rejection (key is well-formed but
+    // Novada doesn't recognize it — e.g. wrong account, disabled key) from a
+    // bare format failure (too short / bad charset), so the agent gets an
+    // accurate diagnosis instead of always being told "check the format".
+    const message = info.verified
+      ? "Your API key is not a valid or active Novada API key. It was rejected by the Novada account API — verify you copied the correct key from your OWN Novada account."
+      : "Invalid API key format. Use your own Novada API key (16+ chars, from your Novada account) as the apikey.";
+    // pre_auth guard-site emit: token is present (even though rejected) — hash/
+    // encrypt it so HQ can still resolve which account attempted the call.
+    await emitGuardRejection({ requestId, token, outcome: "INVALID_TOKEN", rejectionStage: "pre_auth", authMethod, userAgent });
+    return jsonError(401, "INVALID_TOKEN", message,
+      "Check your key at https://dashboard.novada.com/api-key/ — make sure it belongs to YOUR account, not a different one. Get a Novada API key with $10 free credits at https://novada.com if you don't have one.",
+      { "www-authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl(url)}"` });
+  }
+
+  // Per-IP rate limit — slow down abusive loops from an authenticated key.
+  // `ip` was already resolved above (Vercel-trusted header, never spoofable
+  // raw XFF) for the pre-auth gate; reused here rather than re-resolved.
+  if (await rateLimitExceeded(ip, env)) {
+    // rate_limited guard-site emit. Outcome is deliberately "GATEWAY_RATE_LIMITED"
+    // (NOT a NovadaErrorCode) — distinct from a target-side 429 an upstream tool
+    // might raise, per the roundtable doc §6's explicit "网关429 vs target 429" split.
+    await emitGuardRejection({ requestId, token, outcome: "GATEWAY_RATE_LIMITED", rejectionStage: "rate_limited", authMethod, userAgent });
+    // G-3: Retry-After so standard HTTP clients/SDK backoff logic can act on
+    // it, not just the human-readable retry guidance in the message text.
+    return jsonError(429, "RATE_LIMITED",
+      `Too many requests from your IP. Limit is ${env.RATE_LIMIT_PER_MIN || "60"} requests/minute.`,
+      "Retry after 60 seconds. If you need higher limits, contact sales@novada.com.",
+      { "retry-after": "60" });
+  }
+
+  // Upstream Novada API key — the customer's own key, and ONLY their own key
+  // (TOW2-249 pass-through model). The caller's token IS their Novada API key and
+  // every upstream call is billed to THEIR balance. There is deliberately NO
+  // server-env fallback: funding a caller's consumption from the server account is
+  // the exact bug this fixes, and the server consumption creds are stripped from
+  // process.env at cold start anyway (see stripServerConsumptionCreds). `token` is
+  // already validated non-empty above (401 otherwise); the guard is defensive.
+  const apiKey = token?.trim();
+  if (!apiKey) {
+    return jsonError(401, "MISSING_TOKEN",
+      "No Novada API key provided. Pass your own key as ?apikey=YOUR_KEY (or Authorization: Bearer YOUR_KEY) — the hosted endpoint bills each call to your own Novada balance and never to a shared account.",
+      "Get a Novada API key with $10 free credits at https://novada.com — then use it as the apikey in your MCP URL.",
+      { "www-authenticate": `Bearer resource_metadata="${resourceMetadataUrl(url)}"` });
+  }
+
+  // Optional tool-set filter from ?tools= / ?groups= (BrightData-style slim endpoint).
+  const allowedTools = resolveAllowedTools(url);
+
+  // SHA-256 of the API key — used as the KV quota key so the plaintext key is
+  // never written to KV (see tokenKvHash). Computed once per request.
+  const tokenHash = await tokenKvHash(token);
+
+  // Build a fresh server + transport per request (stateless mode). Edge
+  // functions are per-request isolates with no shared memory — same pattern
+  // as the CF Worker port.
+  // `balance` rides along from the validateToken probe (90s-TTL cached) so the
+  // over-cap OR-fallback usually needs no extra upstream round-trip.
+  const server = buildServer(apiKey, env, { token, tokenHash, allowedTools, balance: info.balance, requestId, authMethod, userAgent });
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined, // stateless
+    enableJsonResponse: true,
+  });
+
+  try {
+    await server.connect(transport);
+
+    if (nodeCtx) {
+      // Node runtime: MCP SDK's StreamableHTTPServerTransport.handleRequest
+      // expects Node's (req, res, parsedBody?) and writes the response stream
+      // directly to res. We supply the pre-parsed body because nodeHandler
+      // already consumed req's stream to build the Fetch Request above.
+      // CORS must be set on res BEFORE the SDK writes headers.
+      nodeCtx.res.setHeader("access-control-allow-origin", "*");
+      nodeCtx.res.setHeader("access-control-expose-headers", "mcp-session-id");
+      // SDK types are Node-first; pass through with a cast.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (transport as any).handleRequest(nodeCtx.req, nodeCtx.res, nodeCtx.parsedBody);
+      // Sentinel — nodeHandler checks res.headersSent and skips sendWebRes.
+      return new Response(null, { status: 200, headers: { "x-handled-by": "mcp-transport" } });
+    }
+
+    // Theoretical Fetch-API path (Edge runtime). Unused while we're on Node.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const response: Response = await (transport as any).handleRequest(request);
+    const headers = new Headers(response.headers);
+    headers.set("access-control-allow-origin", "*");
+    headers.set("access-control-expose-headers", "mcp-session-id");
+    return new Response(response.body, { status: response.status, headers });
+  } catch (err) {
+    Sentry.captureException(err);
+    const message = err instanceof Error ? err.message : String(err);
+    return jsonError(500, "TRANSPORT_ERROR", `MCP transport error: ${message}`);
+  } finally {
+    try { await server.close(); } catch { /* noop */ }
+  }
+}

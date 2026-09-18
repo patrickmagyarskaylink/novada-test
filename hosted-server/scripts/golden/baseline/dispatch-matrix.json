@@ -1,0 +1,314 @@
+{
+  "novada_account_summary": {
+    "length_band": "s",
+    "markers": [
+      "Novada Account"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_ai_monitor": {
+    "length_band": "s",
+    "markers": [
+      "Brand Presence on AI-Company Domains \u2014 novada",
+      "Agent Hints"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_browser": {
+    "length_band": "s",
+    "markers": [
+      "Browser Session Results",
+      "Action 1: navigate [ok]",
+      "Action 2: evaluate [ok]",
+      "Agent Hints"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_capture_logs": {
+    "length_band": "s",
+    "markers": [
+      "Novada Account"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_crawl": {
+    "length_band": "s",
+    "markers": [
+      "Crawl Results",
+      "Agent Hints",
+      "[1/1] https://example.com",
+      "Example Domain"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_discover": {
+    "length_band": "l",
+    "markers": [
+      "Novada MCP \u2014 Tool Catalog",
+      "Content Retrieval",
+      "Scraping & Verification",
+      "Proxy",
+      "Browser & Rendering",
+      "Account & Billing",
+      "Health & Discovery",
+      "Tool Groups",
+      "Billing",
+      "Next Steps"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_extract": {
+    "length_band": "s",
+    "markers": [
+      "Extracted Content",
+      "Example Domain",
+      "Agent Hints"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_health": {
+    "length_band": "s",
+    "markers": [
+      "Novada Account"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_health_all": {
+    "length_band": "s",
+    "markers": [
+      "Novada Account"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_map": {
+    "length_band": "s",
+    "markers": [
+      "Site Map",
+      "Agent Hints"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_monitor": {
+    "length_band": "s",
+    "markers": [
+      "Monitor: First Check",
+      "Agent Instruction"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_plan_balance_all": {
+    "length_band": "xs",
+    "markers": [
+      "Plan Balances"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_proxy": {
+    "length_band": "s",
+    "markers": [
+      "Proxy Configuration",
+      "Usage Examples",
+      "as curl:",
+      "Agent Hints",
+      "Ledger (plan preflight)",
+      "Verification (one live IP-echo through this proxy \u2014 ~1 KB metered traffic, ~1s; disable with verify=false)"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_proxy_account_create": {
+    "length_band": "xs",
+    "markers": [],
+    "status": "err",
+    "structural": "other"
+  },
+  "novada_proxy_account_list": {
+    "length_band": "s",
+    "markers": [],
+    "status": "ok",
+    "structural": "other"
+  },
+  "novada_proxy_datacenter": {
+    "length_band": "s",
+    "markers": [
+      "Proxy Configuration",
+      "Usage Examples",
+      "as curl:",
+      "Agent Hints",
+      "Ledger (plan preflight)",
+      "Verification (one live IP-echo through this proxy \u2014 ~1 KB metered traffic, ~1s; disable with verify=false)"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_proxy_dedicated": {
+    "length_band": "s",
+    "markers": [
+      "as curl:"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_proxy_isp": {
+    "length_band": "s",
+    "markers": [
+      "Proxy Configuration",
+      "Usage Examples",
+      "as curl:",
+      "Agent Hints",
+      "Ledger (plan preflight)",
+      "Verification (one live IP-echo through this proxy \u2014 ~1 KB metered traffic, ~1s; disable with verify=false)"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_proxy_mobile": {
+    "length_band": "s",
+    "markers": [
+      "Proxy Configuration",
+      "Usage Examples",
+      "as curl:",
+      "Agent Hints",
+      "Ledger (plan preflight)",
+      "Verification (one live IP-echo through this proxy \u2014 ~1 KB metered traffic, ~1s; disable with verify=false)"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_proxy_residential": {
+    "length_band": "s",
+    "markers": [
+      "Proxy Configuration",
+      "Usage Examples",
+      "as curl:",
+      "Agent Hints",
+      "Ledger (plan preflight)",
+      "Verification (one live IP-echo through this proxy \u2014 ~1 KB metered traffic, ~1s; disable with verify=false)"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_proxy_static": {
+    "length_band": "s",
+    "markers": [
+      "as curl:"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_research": {
+    "length_band": "m",
+    "markers": [
+      "Research: what is anthropic",
+      "Researched source material for: what is anthropic",
+      "Key Findings",
+      "Sources",
+      "Agent Hints"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_scrape": {
+    "length_band": "xs",
+    "markers": [],
+    "status": "err",
+    "structural": "other"
+  },
+  "novada_scraper_result": {
+    "length_band": "xs",
+    "markers": [],
+    "status": "ok",
+    "structural": "other"
+  },
+  "novada_scraper_status": {
+    "length_band": "xs",
+    "markers": [],
+    "status": "ok",
+    "structural": "other"
+  },
+  "novada_scraper_submit": {
+    "length_band": "s",
+    "markers": [
+      "Scrape Results",
+      "Agent Hints"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_search": {
+    "length_band": "s",
+    "markers": [
+      "Search Results",
+      "Next Steps"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_setup": {
+    "length_band": "m",
+    "markers": [
+      "Welcome to Novada",
+      "What you can do",
+      "Optional add-ons",
+      "Agent"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_traffic_daily": {
+    "length_band": "xs",
+    "markers": [
+      "Traffic Usage"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_unblock": {
+    "length_band": "s",
+    "markers": [
+      "Extract Failed",
+      "Agent Hints"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_verify": {
+    "length_band": "m",
+    "markers": [
+      "Claim Verification",
+      "Sources matching the claim wording (<N> sources)",
+      "Sources matching a negation of the claim (<N> sources)",
+      "Agent Hints"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_wallet_balance": {
+    "length_band": "xs",
+    "markers": [
+      "Wallet Balance"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  },
+  "novada_wallet_usage_record": {
+    "length_band": "xs",
+    "markers": [
+      "Wallet Usage History"
+    ],
+    "status": "ok",
+    "structural": "markdown"
+  }
+}

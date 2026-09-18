@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""
+diff-golden.py <baseline_dir> <after_dir>
+
+Extraction of deploy-hosted.sh's inline Python heredoc — the "TWO-TIER VERDICT"
+block inside PHASE 5 (VERIFY), originally ~lines 245-367 of that script — into a
+standalone, independently runnable/testable module. This is a PORT, not a
+redesign: the same two-tier verdict logic is preserved exactly —
+
+    TIER 1 (HARD GATE): 7 deterministic, security/contract files —
+    refused-set.json (firewall), toolslist-default/all/groups.json (tool
+    contract), error-path.json, initialize.json (capabilities) are compared
+    WHOLE-FILE (zero-diff required). redaction-probe.json is the seventh
+    hard-gate file but is compared FIELD-SCOPED, not whole-file (see
+    "redaction-probe.json field-scoped gate" below and _check_redaction_probe).
+
+    TIER 2 (ADVISORY, printed not gated): dispatch-matrix.json per-tool shape —
+    EXCEPT a tool's routing status crossing INTO or OUT OF a refused/unknown
+    state (ROUTING_BAD_STATES), which escalates that specific finding to the
+    hard-gate tier.
+
+    redaction-probe.json field-scoped gate (fixed 2026-08-09, canary run
+    31300731838): this file used to be compared whole-file like the other 6.
+    Its `sample_markers` field records the section headings of the triggering
+    error response (capture-golden.py section 7: `_section_headers(norm_p)[:5]
+    or _top_keys(norm_p)[:5]` on the novada_proxy/novada_proxy_residential/
+    novada_unblock probe response) — and those headings are
+    ENTITLEMENT-DEPENDENT COPY, not a security signal: a provisioned account's
+    novada_proxy error response includes an "as curl:" example section a bare
+    CI account's response omits, so sample_markers legitimately differs by
+    account tier and made the hard gate fail every night on cosmetic copy, not
+    a real regression. The actual security invariant is `leaked` (must stay
+    false) plus the probe's stable contract fields (triggered, trigger_tool,
+    leak_checks' key set, note). Fix: redaction-probe.json is removed from
+    HARD_GATE_FILES' whole-file loop and instead hard-gated field-by-field in
+    _check_redaction_probe(); sample_markers is now printed advisory-only,
+    exactly like dispatch-matrix.json's per-tool shape diff.
+
+deploy-hosted.sh keeps its OWN inline copy of this logic for this pass (left
+fully intact, byte-for-byte, on purpose). FOLLOW-UP, flagged not done here:
+deploy-hosted.sh's VERIFY phase should be refactored to shell out to this
+script (`python3 scripts/golden/diff-golden.py "$GOLDEN_BASELINE" "$GOLDEN_TMP"`)
+instead of maintaining a second inline copy of the same verdict logic. Until
+that follow-up lands, the two copies must be kept in sync by hand if the
+verdict logic ever changes.
+
+One deliberate, narrow behavior change from the heredoc, made during this
+extraction (not a change to the two-tier *architecture* — only to missing-file
+handling for the 7 hard-gate files):
+
+    The original heredoc treats a hard-gate file MISSING FROM BASELINE as soft
+    ("note but don't fail — baseline maintenance issue") regardless of whether
+    after_dir has it. That was a reasonable default while baseline/ was still
+    being built up incrementally. Today baseline/ is a frozen, checked-in
+    artifact (see BASELINE.md — a specific captured version is pinned), so a
+    hard-gate file missing from baseline_dir is itself a broken/corrupted
+    baseline — a real regression in the regression net, not baseline
+    maintenance noise. This script therefore FAILS LOUD (hard gate) in BOTH
+    missing-file directions for the 7 HARD_GATE_FILES: baseline missing a file
+    after_dir has, after_dir missing a file baseline has, or missing in both.
+    dispatch-matrix.json (advisory tier) keeps the original asymmetric
+    behavior: missing in baseline is a soft warning (advisory files never
+    hard-gate on their own absence), missing in after_dir is still a hard fail
+    (a fresh capture that omits a file it should always produce is a capture
+    bug, not baseline drift).
+
+Usage:
+    python3 diff-golden.py <baseline_dir> <after_dir>
+
+Exit codes:
+    0  VERDICT: CLEAN        — no hard-gate failures (dispatch-matrix advisory
+                               diff may still be non-empty; that's expected)
+    1  VERDICT: NEEDS_REVIEW — one or more hard-gate failures, OR a usage/path
+                               error (missing/invalid baseline_dir or after_dir)
+"""
+
+import json
+import sys
+import difflib
+from pathlib import Path
+
+# ── TIER 1: HARD GATE — deterministic + security/contract files (zero-diff required) ──
+# redaction-probe.json is DELIBERATELY NOT in this list — it is the 7th hard-gate
+# file but gets a field-scoped comparison via _check_redaction_probe() instead of
+# the whole-file comparison below (see module docstring: "redaction-probe.json
+# field-scoped gate", fixed 2026-08-09).
+HARD_GATE_FILES = [
+    "refused-set.json",        # firewall: a refused tool becoming reachable = security regression
+    "toolslist-default.json",  # tool contract (visible-by-default set)
+    "toolslist-all.json",      # tool contract (full set)
+    "toolslist-groups.json",   # tool contract (per-group routing)
+    "error-path.json",         # error handling
+    "initialize.json",         # server capabilities
+]
+
+# Routing states that mean "this tool did not route to a real handler".
+# A dispatch-matrix status flipping INTO or OUT OF one of these (when not already
+# accounted for by refused-set.json) is a routing regression = hard escalation.
+#
+# "timeout" added (NOV-854 hardening, 2026-07-19): capture-golden.py's dispatch
+# exception handler (_run_dispatch, the try/except wrapping call_tool()) is the
+# ONLY place dispatch-matrix.json's "status" field gets a value other than "ok"/
+# "err" — see its `except Exception as e: return name, {"status": "timeout", ...}`
+# branch. A mass paid-tool breakage from rate-limiting or wallet depletion (a
+# malformed/non-JSON-RPC response that fails _parse_sse, or a hung request) lands
+# a tool in this exact "timeout" state. Before this fix that crossing was invisible
+# to the hard gate — dispatch-matrix.json is advisory-tier, so a swath of tools
+# flipping ok -> timeout would only ever print in the human-glance advisory diff
+# (VERDICT: CLEAN), never fail CI. Confirmed by reading capture-golden.py directly:
+# no other status string ("refused"/"not_enabled"/"unknown"/"unknown_tool"/
+# "no_handler") is ever actually written to dispatch-matrix.json today — those
+# values are reserved for other routing-bad producers — so "timeout" is the one
+# real gap this pass closes; the four pre-existing entries are left untouched.
+ROUTING_BAD_STATES = {"refused", "not_enabled", "unknown", "unknown_tool", "no_handler", "timeout"}
+
+
+def _tier1_hard_gate(baseline_dir: Path, after_dir: Path) -> list:
+    """Compare the 6 whole-file HARD_GATE_FILES. Returns a list of hard_issues
+    (empty = clean). Prints a clear per-file verdict line for each file as it
+    goes. redaction-probe.json (the 7th hard-gate file) is NOT handled here —
+    see _check_redaction_probe() for its field-scoped comparison.
+    """
+    hard_issues = []
+
+    for fname in HARD_GATE_FILES:
+        bpath = baseline_dir / fname
+        apath = after_dir / fname
+        b_exists = bpath.exists()
+        a_exists = apath.exists()
+
+        # ── missing-file handling (see module docstring for the deliberate
+        # deviation from the original heredoc: fail loud, both directions) ──
+        if not b_exists and not a_exists:
+            hard_issues.append(f"MISSING in both baseline and after (hard-gate file): {fname}")
+            print(f"  [FAIL] {fname}: missing in BOTH baseline_dir and after_dir")
+            continue
+        if not b_exists:
+            hard_issues.append(
+                f"MISSING in baseline (hard-gate file): {fname} — after_dir has it, "
+                f"baseline_dir does not (broken/incomplete baseline, not skippable)")
+            print(f"  [FAIL] {fname}: missing in baseline_dir (present in after_dir)")
+            continue
+        if not a_exists:
+            hard_issues.append(f"MISSING in after (hard-gate file): {fname}")
+            print(f"  [FAIL] {fname}: missing in after_dir (present in baseline_dir)")
+            continue
+
+        b_txt = bpath.read_text()
+        a_txt = apath.read_text()
+        if b_txt != a_txt:
+            diff_lines = list(difflib.unified_diff(
+                b_txt.splitlines(keepends=True),
+                a_txt.splitlines(keepends=True),
+                fromfile=f"baseline/{fname}",
+                tofile=f"after/{fname}",
+                n=3))
+            hard_issues.append(f"{fname} DIFFERS (HARD GATE):\n" + "".join(diff_lines[:60]))
+            print(f"  [FAIL] {fname}: differs from baseline (hard gate)")
+        else:
+            print(f"  [OK]   {fname}: identical to baseline")
+
+    return hard_issues
+
+
+# Stable (non-entitlement-dependent) redaction-probe.json fields. `sample_markers`
+# is deliberately excluded — see module docstring "redaction-probe.json
+# field-scoped gate" (fixed 2026-08-09, canary run 31300731838): it records the
+# triggering error response's section headings, which differ by account
+# entitlement (e.g. a provisioned account's novada_proxy error response includes
+# an "as curl:" example section a bare CI account's response omits), not by
+# security regression.
+REDACTION_PROBE_STABLE_FIELDS = ["triggered", "trigger_tool", "leak_checks_keys", "note"]
+
+
+def _redaction_probe_stable(d: dict) -> dict:
+    """Extract the stable (non-copy-dependent) subset of a redaction-probe.json
+    dict for comparison. `leak_checks` is reduced to its sorted key set (the
+    check *names* are a stable contract; whether any individual boolean value
+    flips is already covered by the explicit leaked=true hard check below —
+    any leak_checks value going True necessarily flips the aggregate `leaked`
+    field True too, per capture-golden.py's `leaked = any(leaked_patterns.values())`)."""
+    lc = d.get("leak_checks")
+    return {
+        "triggered": d.get("triggered"),
+        "trigger_tool": d.get("trigger_tool"),
+        "leak_checks_keys": sorted(lc.keys()) if isinstance(lc, dict) else lc,
+        "note": d.get("note"),
+    }
+
+
+def _check_redaction_probe(baseline_dir: Path, after_dir: Path) -> list:
+    """Field-scoped hard gate for redaction-probe.json (the 7th hard-gate file,
+    handled separately from HARD_GATE_FILES' whole-file loop). Returns a list
+    of hard_issues (empty = clean).
+
+    Gates on:
+      - leaked=true in EITHER baseline or after (the actual security invariant)
+      - a diff in the stable contract fields (REDACTION_PROBE_STABLE_FIELDS)
+    Does NOT gate on `sample_markers` (entitlement-dependent copy) — that is
+    printed advisory-only, matching dispatch-matrix.json's treatment.
+    """
+    hard_issues = []
+    fname = "redaction-probe.json"
+    bpath = baseline_dir / fname
+    apath = after_dir / fname
+    b_exists = bpath.exists()
+    a_exists = apath.exists()
+
+    # ── missing-file handling — identical semantics to the other hard-gate
+    # files (see module docstring): fail loud, both directions ──
+    if not b_exists and not a_exists:
+        hard_issues.append(f"MISSING in both baseline and after (hard-gate file): {fname}")
+        print(f"  [FAIL] {fname}: missing in BOTH baseline_dir and after_dir")
+        return hard_issues
+    if not b_exists:
+        hard_issues.append(
+            f"MISSING in baseline (hard-gate file): {fname} — after_dir has it, "
+            f"baseline_dir does not (broken/incomplete baseline, not skippable)")
+        print(f"  [FAIL] {fname}: missing in baseline_dir (present in after_dir)")
+        return hard_issues
+    if not a_exists:
+        hard_issues.append(f"MISSING in after (hard-gate file): {fname}")
+        print(f"  [FAIL] {fname}: missing in after_dir (present in baseline_dir)")
+        return hard_issues
+
+    try:
+        b = json.loads(bpath.read_text())
+    except Exception as e:
+        hard_issues.append(f"{fname} parse error (baseline): {e}")
+        print(f"  [FAIL] {fname}: baseline parse error: {e}")
+        return hard_issues
+    try:
+        a = json.loads(apath.read_text())
+    except Exception as e:
+        hard_issues.append(f"{fname} parse error (after): {e}")
+        print(f"  [FAIL] {fname}: after parse error: {e}")
+        return hard_issues
+
+    # ── HARD security invariant: the 'leaked' key must be PRESENT in both
+    # files. `.get("leaked") is True` silently evaluates False when the key is
+    # absent — that is a false-negative hole in the security gate (a
+    # corrupt/truncated/tampered capture missing the key would sail through
+    # as if it were leaked=False). Fail loud, same class as leaked==true. ──
+    if "leaked" not in a:
+        hard_issues.append(
+            f"{fname}: 'leaked' key absent (capture corrupt/unsafe) in after")
+        print(f"  [FAIL] {fname}: 'leaked' key absent (capture corrupt/unsafe) in after")
+    if "leaked" not in b:
+        hard_issues.append(
+            f"{fname}: 'leaked' key absent (capture corrupt/unsafe) in baseline")
+        print(f"  [FAIL] {fname}: 'leaked' key absent (capture corrupt/unsafe) in baseline")
+
+    # ── HARD security invariant: leaked must never be true ──
+    if a.get("leaked") is True:
+        hard_issues.append(f"{fname}: leaked=true — SECRET LEAK ON HOSTED")
+        print(f"  [FAIL] {fname}: leaked=true — SECRET LEAK ON HOSTED")
+    if b.get("leaked") is True:
+        # A baseline that itself leaked is corrupt/unsafe to compare against —
+        # fail loud rather than silently accept it as the reference.
+        hard_issues.append(f"{fname}: baseline itself has leaked=true — baseline is corrupt/unsafe")
+        print(f"  [FAIL] {fname}: baseline has leaked=true (corrupt baseline)")
+
+    # ── stable contract fields (excludes entitlement-dependent sample_markers) ──
+    b_stable = _redaction_probe_stable(b)
+    a_stable = _redaction_probe_stable(a)
+    if b_stable != a_stable:
+        for key in REDACTION_PROBE_STABLE_FIELDS:
+            if b_stable.get(key) != a_stable.get(key):
+                hard_issues.append(
+                    f"{fname}: stable field {key!r} differs (HARD GATE): "
+                    f"baseline={b_stable.get(key)!r} after={a_stable.get(key)!r}")
+                print(f"  [FAIL] {fname}: stable field {key!r} differs "
+                      f"(baseline={b_stable.get(key)!r} after={a_stable.get(key)!r})")
+    else:
+        print(f"  [OK]   {fname}: stable fields (triggered/trigger_tool/"
+              f"leak_checks keys/note) identical to baseline")
+
+    # ── sample_markers: ADVISORY ONLY — entitlement/copy-dependent, never gated ──
+    b_markers = b.get("sample_markers")
+    a_markers = a.get("sample_markers")
+    if b_markers != a_markers:
+        print(f"  [ADVISORY] {fname}: sample_markers differs (NOT gated — "
+              f"entitlement-dependent copy): baseline={b_markers!r} after={a_markers!r}")
+    else:
+        print(f"  [ADVISORY] {fname}: sample_markers identical to baseline")
+
+    return hard_issues
+
+
+def _tier2_advisory(baseline_dir: Path, after_dir: Path) -> tuple:
+    """Compare dispatch-matrix.json (ADVISORY tier).
+    Returns (routing_regression_issues, ) — a list to be appended to hard_issues
+    by the caller ONLY for the routing-escalation sub-check; the rest of the
+    per-tool diff is printed for a human glance, never gated.
+    """
+    routing_regressions = []
+    advisory_diff = ""
+    escalation_issues = []
+
+    dm_b = baseline_dir / "dispatch-matrix.json"
+    dm_a = after_dir / "dispatch-matrix.json"
+
+    if dm_b.exists() and dm_a.exists():
+        try:
+            b = json.loads(dm_b.read_text())
+            a = json.loads(dm_a.read_text())
+        except Exception as e:
+            # If dispatch-matrix won't parse, that's advisory noise, not a hard fail
+            print(f"  [WARN] dispatch-matrix.json parse issue: {e}")
+            b, a = {}, {}
+
+        # Hard sub-check: routing state crossings
+        for tool in sorted(set(b) | set(a)):
+            b_status = (b.get(tool) or {}).get("status")
+            a_status = (a.get(tool) or {}).get("status")
+            b_bad = b_status in ROUTING_BAD_STATES
+            a_bad = a_status in ROUTING_BAD_STATES
+            # A crossing INTO or OUT OF a routing-bad state = regression signal.
+            # (Tools legitimately refused are captured in refused-set.json, which is a
+            #  separate hard gate — they don't appear here as "refused" unless routing broke.)
+            if b_bad != a_bad:
+                routing_regressions.append(
+                    f"    {tool}: status {b_status!r} -> {a_status!r} (routing state crossing)")
+
+        # Build advisory text (full per-tool diff, for a human eyeball)
+        b_txt = json.dumps(b, sort_keys=True, indent=2).splitlines(keepends=True)
+        a_txt = json.dumps(a, sort_keys=True, indent=2).splitlines(keepends=True)
+        dlines = list(difflib.unified_diff(b_txt, a_txt,
+                                           fromfile="baseline/dispatch-matrix.json",
+                                           tofile="after/dispatch-matrix.json",
+                                           n=2))
+        advisory_diff = "".join(dlines[:120])
+    elif not dm_b.exists() and not dm_a.exists():
+        print("  [WARN] dispatch-matrix.json missing in both baseline_dir and after_dir "
+              "— advisory tier, not gated")
+    elif not dm_b.exists():
+        print("  [WARN] baseline missing dispatch-matrix.json (advisory tier — not gated)")
+    elif not dm_a.exists():
+        escalation_issues.append("MISSING in after: dispatch-matrix.json")
+        print("  [FAIL] dispatch-matrix.json: missing in after_dir "
+              "(a fresh capture must always produce it)")
+
+    if advisory_diff.strip():
+        print("\n--- ADVISORY: routing/shape changes (human glance) ---")
+        print(advisory_diff)
+        print("--- END ADVISORY ---")
+    else:
+        print("\n--- ADVISORY: dispatch-matrix.json identical to baseline ---")
+
+    # Routing regressions escalate to the hard tier
+    if routing_regressions:
+        escalation_issues.append(
+            "ROUTING REGRESSION in dispatch-matrix (status crossed a refused/unknown boundary):\n"
+            + "\n".join(routing_regressions))
+        print("\n  [FAIL] dispatch-matrix.json: routing regression ESCALATED to HARD GATE:")
+        for r in routing_regressions:
+            print(r)
+
+    return escalation_issues
+
+
+def compare(baseline_dir: Path, after_dir: Path) -> int:
+    """Run the full two-tier verdict. Returns 0 (CLEAN) or 1 (NEEDS_REVIEW)."""
+    print(f"[diff-golden] baseline={baseline_dir}  after={after_dir}")
+    print("\n--- TIER 1: HARD GATE (6 whole-file deterministic + security/contract files) ---")
+    hard_issues = _tier1_hard_gate(baseline_dir, after_dir)
+
+    print("\n--- TIER 1b: HARD GATE (redaction-probe.json, field-scoped) ---")
+    hard_issues += _check_redaction_probe(baseline_dir, after_dir)
+
+    print("\n--- TIER 2: ADVISORY (dispatch-matrix.json) ---")
+    hard_issues += _tier2_advisory(baseline_dir, after_dir)
+
+    if hard_issues:
+        print("\n--- HARD GATE FAILURES ---")
+        for iss in hard_issues:
+            print(iss)
+        print("--- END HARD GATE ---\n")
+        print("VERDICT: NEEDS_REVIEW")
+        return 1
+
+    print("\n[HARD GATE] all 7 hard-gate files clean (6 whole-file + redaction-probe.json "
+          "field-scoped); no routing regression.")
+    print("VERDICT: CLEAN")
+    return 0
+
+
+def _run_single_check(check_file: str, baseline_dir: Path, after_dir: Path) -> int:
+    """Run ONE named hard-gate check in isolation and print just its verdict.
+
+    Added (F6 fix, 2026-08-11) so deploy-hosted.sh's VERIFY phase can get
+    JUST the redaction-probe.json field-scoped verdict from this module
+    instead of re-implementing _check_redaction_probe's field-scoping inline.
+    deploy-hosted.sh already runs its own inline whole-file comparison for
+    the other 6 HARD_GATE_FILES plus the dispatch-matrix.json advisory tier
+    (that duplication is a separate, larger tracked follow-up — see module
+    docstring); calling the full compare() here for a single-file need would
+    just print a second, redundant, confusing verdict for the same dirs.
+    This entry point is purely additive: it does not change compare()'s
+    existing whole-dir default behavior (invoked with no --check-file flag).
+    """
+    name = check_file.replace(".json", "")
+    if name != "redaction-probe":
+        print(f"ERROR: unsupported --check-file value: {check_file!r} "
+              f"(supported: redaction-probe)", file=sys.stderr)
+        return 1
+
+    print(f"[diff-golden --check-file redaction-probe] baseline={baseline_dir}  after={after_dir}")
+    issues = _check_redaction_probe(baseline_dir, after_dir)
+
+    if issues:
+        print("\n--- HARD GATE FAILURES (redaction-probe.json) ---")
+        for iss in issues:
+            print(iss)
+        print("--- END HARD GATE ---\n")
+        print("VERDICT: NEEDS_REVIEW")
+        return 1
+
+    print("\nVERDICT: CLEAN")
+    return 0
+
+
+def main(argv: list) -> int:
+    args = list(argv[1:])
+
+    # Additive CLI mode (F6 fix, 2026-08-11): an optional leading
+    # `--check-file <name>` flag runs ONLY that named hard-gate check
+    # (currently just "redaction-probe") instead of the full whole-dir
+    # compare(). MUST NOT change the default 2-arg invocation below, which
+    # the nightly canary depends on.
+    check_file = None
+    if args and args[0] == "--check-file":
+        if len(args) < 2:
+            print("Usage: diff-golden.py --check-file <name> <baseline_dir> <after_dir>",
+                  file=sys.stderr)
+            return 1
+        check_file = args[1]
+        args = args[2:]
+
+    if len(args) < 2:
+        print("Usage: diff-golden.py [--check-file <name>] <baseline_dir> <after_dir>",
+              file=sys.stderr)
+        return 1
+
+    baseline_dir = Path(args[0])
+    after_dir = Path(args[1])
+
+    # Fail loud on a bad invocation rather than let a typo'd path silently
+    # compare against nothing (Path.exists()/read_text() on a missing dir
+    # would raise deep inside the loop with a much less useful traceback).
+    if not baseline_dir.is_dir():
+        print(f"ERROR: baseline_dir does not exist or is not a directory: {baseline_dir}",
+              file=sys.stderr)
+        return 1
+    if not after_dir.is_dir():
+        print(f"ERROR: after_dir does not exist or is not a directory: {after_dir}",
+              file=sys.stderr)
+        return 1
+
+    if check_file is not None:
+        return _run_single_check(check_file, baseline_dir, after_dir)
+
+    return compare(baseline_dir, after_dir)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

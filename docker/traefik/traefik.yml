@@ -1,0 +1,43 @@
+# traefik.yml — STATIC configuration (read once at startup).
+#
+# Provider choice: FILE, not Docker. The Docker provider would need
+# /var/run/docker.sock mounted into Traefik, which hands a container root-equivalent
+# control over the host daemon — a poor trade for a stack whose routing table is
+# fully known up front. The file provider also ports 1:1 to ECS, where no Docker
+# socket exists. Routers/services/middlewares live in ./dynamic.yml.
+
+entryPoints:
+  web:
+    address: ":80"
+    transport:
+      respondingTimeouts:
+        # A tool call may run up to ~296s (TOOL_WALL_CLOCK_MS in api/mcp.ts).
+        # Same constraint as an ALB idle timeout: must sit ABOVE the app budget,
+        # or long research/scrape calls die as a 504 that is not valid JSON-RPC.
+        readTimeout: 330s
+        writeTimeout: 330s
+        idleTimeout: 90s
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+api:
+  dashboard: true
+  # Local-only: exposes the router/service table with NO auth on the traefik
+  # container's :8080. Published to the host as TRAEFIK_DASHBOARD_PORT (8090 by
+  # default) purely so you can see which router matched. Do not carry this flag
+  # into a deployed environment.
+  insecure: true
+
+log:
+  level: INFO
+
+# Access logs stay OFF on purpose: MCP clients authenticate with ?apikey=<key>
+# in the query string, so an access log is a plaintext credential store. This is
+# the same reasoning as "do not enable ALB access logs" in docker/README.md.
+accessLog: null
+
+ping:
+  entryPoint: web

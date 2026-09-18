@@ -1,0 +1,164 @@
+name: Nightly Canary (prod backend — Layers 2/6/7)
+
+# Runs the deploy-time verification suite AGAINST THE LIVE, ALREADY-DEPLOYED
+# https://mcp.novada.com/mcp — on a schedule, independent of any deploy.
+#
+# THIS IS NOT A PR GATE. It never runs on push/pull_request and it does not
+# test the code in this PR/branch — it tests whatever is CURRENTLY DEPLOYED to
+# production. Do not wire `paths:` filters onto this workflow the way the
+# other CI workflows in this repo are filtered; there is no meaningful path
+# filter for "what's live right now."
+#
+# Why this exists: deploy-hosted.sh's own VERIFY phase already runs this same
+# capture -> diff -> contract sequence, but ONLY when a human runs a deploy
+# (REDLINE-gated, per repo CLAUDE.md). Between deploys, nothing re-checks that
+# the live backend still behaves the way BASELINE.md says it should — a
+# a third-party dependency bump, an expired credential, an upstream platform
+# API change, or an infra blip could silently break Layers 2/6/7 coverage with
+# zero signal until the next deploy happens to notice. This workflow closes
+# that gap with a scheduled, deploy-independent check.
+#
+# Steps mirror deploy-hosted.sh PHASE 5 (VERIFY) exactly, using the two
+# extracted/standalone scripts instead of PHASE 5's inline heredoc + inline
+# contract-test.py invocation:
+#   1. capture-golden.py  https://mcp.novada.com/mcp  -> fresh snapshot dir
+#   2. diff-golden.py     <checked-in baseline/>  <fresh snapshot dir>
+#   3. contract-test.py   https://mcp.novada.com/mcp   (CONTRACT_FULL=1 —
+#      billable invariants armed nightly since 2026-07-30 to keep BILLING_TRUTH
+#      [funded key never denied service, TOW2-349 regression guard] on watch;
+#      costs a few billable calls/night on the funded test key)
+#
+# Secret required: secrets.NOVADA_TEST_KEY — the same repo secret the (green)
+# synthetic-monitor.yml already uses against mcp.novada.com. The env VAR name
+# stays NOVADA_MCP_KEY (what capture-golden.py / contract-test.py read; matches
+# deploy-hosted.sh). 2026-07-27 fix: this workflow originally referenced a
+# secrets.NOVADA_MCP_KEY that was never created (the key was added 2026-07-24
+# under the name NOVADA_TEST_KEY instead), so every canary run failed in ~8s
+# with an empty key before ever reaching prod.
+
+on:
+  schedule:
+    # 06:17 UTC daily — an off-minute (not top-of-hour) to avoid the scheduled-
+    # job pile-up window every other repo's "0 6 * * *"/"0 * * * *" cron
+    # collides into on GitHub Actions' shared runners.
+    - cron: "17 6 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  canary:
+    name: golden capture + diff + contract (FREE) vs mcp.novada.com
+    runs-on: ubuntu-latest
+    # Job-level env so TELEMETRY_SUPABASE_URL/TELEMETRY_SUPABASE_SERVICE_KEY are
+    # readable via the `env` context in the telemetry-canary step's `if:`
+    # condition below — GitHub Actions FORBIDS the `secrets` context inside a
+    # step `if:` (see synthetic-monitor.yml's identical comment on this same
+    # constraint); the `env` context IS allowed there, but only for vars set at
+    # job/workflow scope — a step's OWN `env:` block is not visible to its own
+    # `if:` condition, so these must be promoted here rather than left inline
+    # on the step.
+    env:
+      TELEMETRY_SUPABASE_URL: ${{ secrets.TELEMETRY_SUPABASE_URL }}
+      TELEMETRY_SUPABASE_SERVICE_KEY: ${{ secrets.TELEMETRY_SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # capture-golden.py / diff-golden.py / contract-test.py are all stdlib-only
+      # (see their own headers) — no requirements.txt, no pip install needed.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Capture golden snapshot from live prod
+        env:
+          NOVADA_MCP_KEY: ${{ secrets.NOVADA_TEST_KEY }}
+        run: |
+          mkdir -p /tmp/golden-canary
+          python3 hosted-server/scripts/golden/capture-golden.py \
+            https://mcp.novada.com/mcp \
+            /tmp/golden-canary
+
+      # Two-tier verdict: hard-fails (exit 1) on any of the 7 structural files
+      # differing, a redaction leak, or a dispatch-matrix routing escalation.
+      # dispatch-matrix.json shape drift alone is printed as advisory, not gated.
+      - name: Diff fresh capture against checked-in baseline
+        run: |
+          python3 hosted-server/scripts/golden/diff-golden.py \
+            hosted-server/scripts/golden/baseline \
+            /tmp/golden-canary
+
+      # if: always() so a golden-diff failure above doesn't hide whether the
+      # contract invariants also failed — both signals are worth seeing in the
+      # same nightly run, exactly like deploy-hosted.sh reports both gates
+      # before combining them into one final verdict.
+      #
+      # CONTRACT_FULL=1 (2026-07-30, TOW2-349): arms the billable invariant set,
+      # including the new BILLING_TRUTH permanent regression guard for the
+      # ledger-split incident (a funded key — wallet OR capture balance > 0 —
+      # must never be denied service by the free-gateway cap). This also arms
+      # the existing NO_SILENT_NOOP / NO_LYING_ZERO / HEALTH_TRUTH-probe billable
+      # invariants — intended: costs a few billable calls nightly on the funded
+      # NOVADA_TEST_KEY, in exchange for nightly (not just deploy-time) coverage
+      # of this regression class.
+      # Exit-code contract (2026-08-11, contract-test.py): a run exits 0 when
+      # the only findings are (a) our OWN gateway's HTTP 429 rate-limiter
+      # (retried 3x with backoff, then SKIPped — self-inflicted throttle
+      # carries zero signal about the product) or (b) the 4 PARAM_HONESTY
+      # rows tracked as TOW2-376 (novada_proxy/_browser/_ai_monitor/_extract
+      # param-honesty gaps — still RUN and detected every night, just
+      # downgraded to a visible "XFAIL: KNOWN (TOW2-376)" line instead of a
+      # hard failure). Every other invariant (hidden/bad-tool refusal,
+      # agent_instruction presence, redaction, tool-list correctness,
+      # server-up/auth, real-source-URLs, and any PARAM_HONESTY row NOT in
+      # contract-test.py's KNOWN_ISSUES table) still hard-fails on a genuine
+      # regression — a nonzero exit here means a real, un-tracked break, and
+      # this step failing is what should trigger GitHub's failure email.
+      # Run `python3 hosted-server/scripts/contract/contract-test.py
+      # --self-test` to exercise this classifier with synthetic inputs
+      # (no network, no live key) if this step's meaning is ever in doubt.
+      - name: Contract invariant tests (CONTRACT_FULL — billable)
+        if: always()
+        env:
+          NOVADA_MCP_KEY: ${{ secrets.NOVADA_TEST_KEY }}
+          CONTRACT_FULL: "1"
+        run: |
+          python3 hosted-server/scripts/contract/contract-test.py https://mcp.novada.com/mcp
+
+      # Evidence for NEEDS_REVIEW verdicts: the fresh capture (taken with the
+      # CI account's key, i.e. what the diff actually compared) rides along as
+      # an artifact whenever the run fails, so re-baselining never requires
+      # guessing what CI saw. Snapshot files are scrubbed by capture-golden.py
+      # (redaction probe asserts no credentials) — safe to retain 14 days.
+      - name: Upload fresh capture on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-canary-capture-${{ github.run_id }}
+          path: /tmp/golden-canary/
+          retention-days: 14
+
+      # 2026-08-26 addition (telemetry capture+delivery hardening): proves a
+      # REAL synthetic call against live prod produces a `pushed` mcp_events
+      # row within ~90s — the ONE check nothing above exercises (the golden/
+      # contract steps assert tool BEHAVIOR, not that telemetry for that call
+      # ever reached HQ). See hosted-server/scripts/telemetry-delivery-canary.mjs.
+      #
+      # Gated on the env context (not `secrets.*` directly — GitHub forbids
+      # `secrets.*` inside a step `if:`, see synthetic-monitor.yml's identical
+      # comment) because TELEMETRY_SUPABASE_URL/TELEMETRY_SUPABASE_SERVICE_KEY
+      # are NOT YET provisioned as repo secrets as of this writing — this step
+      # is dark-deploy safe and no-ops (skip, exit 0) until the owner adds
+      # them, same pattern as every other credential-gated step in this repo.
+      - name: Setup Node.js 20
+        if: always()
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Telemetry delivery canary (synthetic call -> pushed row within budget)
+        if: always() && env.TELEMETRY_SUPABASE_URL != '' && env.TELEMETRY_SUPABASE_SERVICE_KEY != ''
+        env:
+          NOVADA_TEST_KEY: ${{ secrets.NOVADA_TEST_KEY }}
+          MCP_URL: https://mcp.novada.com/mcp
+        run: node hosted-server/scripts/telemetry-delivery-canary.mjs

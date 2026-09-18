@@ -1,0 +1,215 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="1040" viewBox="0 0 1760 1040" role="img" aria-labelledby="t d">
+  <title id="t">Novada MCP on AWS Fargate — deployment architecture</title>
+  <desc id="d">An MCP client calls an Application Load Balancer with an AWS WAF rate-based rule. The ALB forwards to an ECS Fargate service in private subnets. Each task runs two containers sharing one network namespace: the novada-mcp gateway on port 8080 and a serverless-redis-http sidecar on port 8079 that translates the Upstash REST protocol to ElastiCache over TLS with AUTH. Outbound tool traffic leaves through a NAT gateway to api.novada.com. Secrets Manager, ECR, CloudWatch Logs and an optional EventBridge schedule sit outside the VPC. An optional RDS Postgres with PostgREST holds the telemetry event log.</desc>
+
+  <defs>
+    <style>
+      .sans{font-family:"Avenir Next",Avenir,Inter,ui-sans-serif,system-ui,sans-serif}
+      .mono{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+      .h1{font-size:29px;font-weight:700;fill:#232F3E}
+      .h2{font-size:14.5px;fill:#544B8A}
+      .zone{font-size:14px;font-weight:700;fill:#232F3E;letter-spacing:.4px}
+      .sub{font-size:12px;font-weight:700;letter-spacing:.6px}
+      .box-t{font-size:14px;font-weight:700;fill:#232F3E}
+      .box-s{font-size:10.6px;fill:#5A6376}
+      .box-m{font-size:10.6px;fill:#44289F}
+      .lg-t{font-size:14px;font-weight:700;fill:#232F3E}
+      .lg{font-size:11.4px;fill:#3C4353}
+      .note{font-size:11.4px;fill:#544B8A}
+      .badge-n{font-size:12px;font-weight:700;fill:#fff}
+      .flow{stroke:#6B41DE;stroke-width:2.2;fill:none}
+      .ctrl{stroke:#98A0B3;stroke-width:1.8;fill:none;stroke-dasharray:6 5}
+    </style>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 10 5 0 10Z" fill="#6B41DE"/>
+    </marker>
+    <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 10 5 0 10Z" fill="#98A0B3"/>
+    </marker>
+  </defs>
+
+  <rect width="1760" height="1040" fill="#FBFAFF"/>
+  <text class="sans h1" x="40" y="48">Novada MCP on AWS Fargate — deployment architecture</text>
+  <text class="sans h2" x="40" y="76">No changes to the MCP codebase. Numbered path = one MCP request. Dashed = optional or control plane.</text>
+
+  <!-- ───────── client ───────── -->
+  <rect x="40" y="303" width="240" height="100" rx="10" fill="#fff" stroke="#544B8A" stroke-width="1.5"/>
+  <text class="sans box-t" x="60" y="333">MCP client</text>
+  <text class="sans box-s" x="60" y="355">Claude · Cursor · VS Code · curl</text>
+  <text class="mono box-m" x="60" y="376">?apikey= or Bearer</text>
+  <text class="sans box-s" x="60" y="394">every caller brings their own key</text>
+
+  <!-- ───────── AWS account ───────── -->
+  <rect x="320" y="110" width="1160" height="880" rx="14" fill="#FFFFFF" stroke="#232F3E" stroke-width="2"/>
+  <text class="sans zone" x="344" y="138">AWS account · eu-central-1</text>
+
+  <rect x="360" y="158" width="210" height="62" rx="8" fill="#fff" stroke="#FF9900" stroke-width="1.5"/>
+  <text class="sans box-t" x="376" y="183">Route 53</text>
+  <text class="mono box-s" x="376" y="204">mcp.your-domain.tld</text>
+
+  <rect x="600" y="158" width="270" height="62" rx="8" fill="#fff" stroke="#FF9900" stroke-width="1.5"/>
+  <text class="sans box-t" x="616" y="183">AWS WAF</text>
+  <text class="sans box-s" x="616" y="204">rate-based rule, per source IP</text>
+
+  <rect x="900" y="158" width="540" height="62" rx="8" fill="#FFFBF2" stroke="#FFD48A" stroke-width="1.2"/>
+  <text class="sans box-s" x="918" y="181">WAF carries the per-IP throttling because the gateway's own limiter cannot</text>
+  <text class="sans box-s" x="918" y="200">see the client IP behind an ALB (it reads x-real-ip, which no ALB sets).</text>
+
+  <!-- ───────── VPC ───────── -->
+  <rect x="360" y="245" width="1080" height="590" rx="12" fill="#FCFAFF" stroke="#8C4FFF" stroke-width="2" stroke-dasharray="7 5"/>
+  <text class="sans sub" x="380" y="271" fill="#6B21D9">VPC 10.0.0.0/16</text>
+
+  <!-- public subnets -->
+  <rect x="384" y="290" width="1032" height="110" rx="8" fill="#F5FAEF" stroke="#7AA116" stroke-width="1.3" stroke-dasharray="4 3"/>
+  <text class="sans sub" x="400" y="312" fill="#5C7A10">PUBLIC SUBNETS · 2 AZ</text>
+  <rect x="410" y="322" width="430" height="62" rx="8" fill="#fff" stroke="#FF9900" stroke-width="1.5"/>
+  <text class="sans box-t" x="426" y="347">Application Load Balancer</text>
+  <text class="sans box-s" x="426" y="369">:443 → :8080 · idle timeout 350 s · access logs OFF</text>
+  <rect x="1150" y="322" width="250" height="62" rx="8" fill="#fff" stroke="#FF9900" stroke-width="1.5"/>
+  <text class="sans box-t" x="1166" y="347">NAT Gateway</text>
+  <text class="sans box-s" x="1166" y="369">egress for every tool call</text>
+
+  <!-- private app subnets -->
+  <rect x="384" y="425" width="1032" height="245" rx="8" fill="#F2F7FF" stroke="#0972D3" stroke-width="1.3" stroke-dasharray="4 3"/>
+  <text class="sans sub" x="400" y="447" fill="#0B5CAD">PRIVATE SUBNETS · APP · 2 AZ</text>
+  <text class="sans box-s" x="400" y="466">ECS Fargate service · desiredCount 2</text>
+
+  <!-- task A -->
+  <rect x="410" y="478" width="490" height="180" rx="10" fill="#fff" stroke="#6B41DE" stroke-width="1.6"/>
+  <text class="sans box-t" x="426" y="502" fill="#44289F">Fargate task · awsvpc</text>
+  <text class="sans box-s" x="426" y="520">one ENI — both containers share the network namespace</text>
+  <rect x="424" y="532" width="220" height="108" rx="8" fill="#EFE9FE" stroke="#6B41DE" stroke-width="1.3"/>
+  <text class="sans box-t" x="438" y="556">gateway</text>
+  <text class="mono box-m" x="438" y="576">novada-mcp:gateway</text>
+  <text class="sans box-s" x="438" y="596">:8080 · non-root · SIGTERM drain</text>
+  <text class="sans box-s" x="438" y="614">/health = target group probe</text>
+  <text class="sans box-s" x="438" y="632">no Novada key on the server</text>
+  <rect x="676" y="532" width="208" height="108" rx="8" fill="#FFF6E8" stroke="#FF9900" stroke-width="1.3"/>
+  <text class="sans box-t" x="690" y="556">kv · sidecar</text>
+  <text class="mono box-m" x="690" y="576">serverless-redis-http</text>
+  <text class="sans box-s" x="690" y="596">:8079 Upstash-REST façade</text>
+  <text class="sans box-s" x="690" y="614">reached only via localhost</text>
+  <text class="sans box-s" x="690" y="632">in no target group</text>
+
+  <!-- task B (faded duplicate) -->
+  <g opacity="0.5">
+    <rect x="920" y="478" width="490" height="180" rx="10" fill="#fff" stroke="#6B41DE" stroke-width="1.6" stroke-dasharray="6 4"/>
+    <text class="sans box-t" x="936" y="502" fill="#44289F">Fargate task · 2nd AZ</text>
+    <text class="sans box-s" x="936" y="520">identical container pair — scale out by desiredCount</text>
+    <rect x="934" y="532" width="220" height="108" rx="8" fill="#EFE9FE" stroke="#6B41DE" stroke-width="1.3"/>
+    <text class="sans box-t" x="948" y="556">gateway</text>
+    <text class="mono box-m" x="948" y="576">:8080</text>
+    <rect x="1186" y="532" width="208" height="108" rx="8" fill="#FFF6E8" stroke="#FF9900" stroke-width="1.3"/>
+    <text class="sans box-t" x="1200" y="556">kv · sidecar</text>
+    <text class="mono box-m" x="1200" y="576">:8079</text>
+  </g>
+
+  <!-- private data subnets -->
+  <rect x="384" y="695" width="1032" height="120" rx="8" fill="#F2F7FF" stroke="#0972D3" stroke-width="1.3" stroke-dasharray="4 3"/>
+  <text class="sans sub" x="400" y="717" fill="#0B5CAD">PRIVATE SUBNETS · DATA · 2 AZ</text>
+  <rect x="410" y="727" width="450" height="72" rx="8" fill="#fff" stroke="#FF9900" stroke-width="1.5"/>
+  <text class="sans box-t" x="426" y="752">ElastiCache · Valkey/Redis 7</text>
+  <text class="sans box-s" x="426" y="772">TLS + AUTH · cluster mode OFF · 1 primary + 1 replica</text>
+  <text class="sans box-s" x="426" y="790">monthly quota · rate buckets · token-verify cache (all TTL'd)</text>
+  <rect x="930" y="727" width="470" height="72" rx="8" fill="#FBFCFF" stroke="#0972D3" stroke-width="1.3" stroke-dasharray="5 4"/>
+  <text class="sans box-t" x="946" y="752" fill="#0B5CAD">optional · RDS Postgres + PostgREST</text>
+  <text class="sans box-s" x="946" y="772">mcp_events telemetry log — metadata only, no payloads</text>
+  <text class="sans box-s" x="946" y="790">fail-open: unset TELEMETRY_* and the gateway does not care</text>
+
+  <!-- regional services -->
+  <text class="sans sub" x="344" y="866" fill="#232F3E">REGIONAL SERVICES · NO VPC PLACEMENT</text>
+  <rect x="360" y="878" width="255" height="92" rx="8" fill="#fff" stroke="#FF9900" stroke-width="1.5"/>
+  <text class="sans box-t" x="376" y="902">Amazon ECR</text>
+  <text class="mono box-m" x="376" y="922">novada-mcp-gateway:0.9.39</text>
+  <text class="sans box-s" x="376" y="941">pulled at task start</text>
+  <text class="sans box-s" x="376" y="959">build per arch: amd64 or arm64</text>
+
+  <rect x="637" y="878" width="255" height="92" rx="8" fill="#fff" stroke="#FF9900" stroke-width="1.5"/>
+  <text class="sans box-t" x="653" y="902">Secrets Manager</text>
+  <text class="mono box-m" x="653" y="922">kv-token · oauth-enc-key</text>
+  <text class="mono box-m" x="653" y="940">elasticache-url</text>
+  <text class="sans box-s" x="653" y="959">kv-token is shared by both containers</text>
+
+  <rect x="914" y="878" width="255" height="92" rx="8" fill="#fff" stroke="#FF9900" stroke-width="1.5"/>
+  <text class="sans box-t" x="930" y="902">CloudWatch Logs</text>
+  <text class="mono box-m" x="930" y="922">/ecs/novada-mcp</text>
+  <text class="sans box-s" x="930" y="941">streams: gateway · kv</text>
+  <text class="sans box-s" x="930" y="959">no request bodies, no keys</text>
+
+  <rect x="1191" y="878" width="249" height="92" rx="8" fill="#FBFCFF" stroke="#98A0B3" stroke-width="1.3" stroke-dasharray="5 4"/>
+  <text class="sans box-t" x="1207" y="902">EventBridge Scheduler</text>
+  <text class="sans box-s" x="1207" y="922">API destination → /api/reconcile</text>
+  <text class="sans box-s" x="1207" y="941">Bearer CRON_SECRET</text>
+  <text class="sans box-s" x="1207" y="959">only with telemetry enabled</text>
+
+  <!-- ───────── upstream ───────── -->
+  <rect x="1520" y="303" width="220" height="100" rx="10" fill="#fff" stroke="#544B8A" stroke-width="1.5"/>
+  <text class="sans box-t" x="1536" y="333">Novada upstream</text>
+  <text class="mono box-m" x="1536" y="354">api.novada.com</text>
+  <text class="sans box-s" x="1536" y="374">scraper · SERP · proxy net</text>
+  <text class="sans box-s" x="1536" y="392">billed to the caller's key</text>
+
+  <!-- ───────── flows ───────── -->
+  <path class="flow" d="M280 353 H404" marker-end="url(#a)"/>
+  <circle cx="342" cy="353" r="11" fill="#6B41DE"/><text class="sans badge-n" x="342" y="357.5" text-anchor="middle">1</text>
+
+  <path class="flow" d="M625 384 V430 H655 V472" marker-end="url(#a)"/>
+  <circle cx="640" cy="430" r="11" fill="#6B41DE"/><text class="sans badge-n" x="640" y="434.5" text-anchor="middle">2</text>
+
+  <path class="flow" d="M644 586 H670" marker-end="url(#a)"/>
+  <circle cx="657" cy="565" r="10" fill="#6B41DE"/><text class="sans badge-n" x="657" y="569.5" text-anchor="middle">3</text>
+
+  <path class="flow" d="M780 640 V688 H635 V721" marker-end="url(#a)"/>
+  <circle cx="707" cy="688" r="11" fill="#6B41DE"/><text class="sans badge-n" x="707" y="692.5" text-anchor="middle">4</text>
+
+  <path class="flow" d="M900 500 H910 V412 H1275 V390" marker-end="url(#a)"/>
+  <path class="flow" d="M1400 353 H1514" marker-end="url(#a)"/>
+  <circle cx="1080" cy="412" r="11" fill="#6B41DE"/><text class="sans badge-n" x="1080" y="416.5" text-anchor="middle">5</text>
+
+  <path class="ctrl" d="M886 905 H905 V664" marker-end="url(#ac)"/>
+  <circle cx="905" cy="790" r="11" fill="#98A0B3"/><text class="sans badge-n" x="905" y="794.5" text-anchor="middle">6</text>
+
+  <!-- ───────── legend ───────── -->
+  <rect x="40" y="440" width="250" height="540" rx="10" fill="#fff" stroke="#E4DCFD" stroke-width="1.5"/>
+  <text class="sans lg-t" x="58" y="468">Request path</text>
+
+  <circle cx="70" cy="492" r="10" fill="#6B41DE"/><text class="sans badge-n" x="70" y="496.5" text-anchor="middle">1</text>
+  <text class="sans lg" x="90" y="489">HTTPS in. The WAF rate rule</text>
+  <text class="sans lg" x="90" y="504">applies at this hop.</text>
+
+  <circle cx="70" cy="536" r="10" fill="#6B41DE"/><text class="sans badge-n" x="70" y="540.5" text-anchor="middle">2</text>
+  <text class="sans lg" x="90" y="533">ALB → gateway :8080 as an IP</text>
+  <text class="sans lg" x="90" y="548">target. Probe: /health.</text>
+
+  <circle cx="70" cy="580" r="10" fill="#6B41DE"/><text class="sans badge-n" x="70" y="584.5" text-anchor="middle">3</text>
+  <text class="sans lg" x="90" y="577">gateway → kv over localhost.</text>
+  <text class="sans lg" x="90" y="592">@vercel/kv speaks the Upstash</text>
+  <text class="sans lg" x="90" y="607">REST protocol, not the Redis</text>
+  <text class="sans lg" x="90" y="622">wire protocol — hence a sidecar.</text>
+
+  <circle cx="70" cy="654" r="10" fill="#6B41DE"/><text class="sans badge-n" x="70" y="658.5" text-anchor="middle">4</text>
+  <text class="sans lg" x="90" y="651">kv → ElastiCache over</text>
+  <text class="mono lg" x="90" y="666">rediss://:AUTH@…:6379</text>
+
+  <circle cx="70" cy="698" r="10" fill="#6B41DE"/><text class="sans badge-n" x="70" y="702.5" text-anchor="middle">5</text>
+  <text class="sans lg" x="90" y="695">gateway → NAT → upstream.</text>
+  <text class="sans lg" x="90" y="710">Every call verifies the caller's</text>
+  <text class="sans lg" x="90" y="725">key, then does the real work.</text>
+
+  <circle cx="70" cy="757" r="10" fill="#98A0B3"/><text class="sans badge-n" x="70" y="761.5" text-anchor="middle">6</text>
+  <text class="sans lg" x="90" y="754">Secrets injected at task start</text>
+  <text class="sans lg" x="90" y="769">by the task execution role.</text>
+
+  <line x1="58" y1="792" x2="272" y2="792" stroke="#E4DCFD" stroke-width="1.5"/>
+  <text class="sans lg-t" x="58" y="816">Two things to keep straight</text>
+  <text class="sans lg" x="58" y="840">The timeout chain must widen</text>
+  <text class="sans lg" x="58" y="855">outward: ~296 s tool budget &lt;</text>
+  <text class="sans lg" x="58" y="870">320 s container &lt; 350 s ALB.</text>
+  <text class="sans lg" x="58" y="898">?apikey= travels in the URL, so</text>
+  <text class="sans lg" x="58" y="913">ALB access logs stay OFF and</text>
+  <text class="sans lg" x="58" y="928">nothing caches /mcp.</text>
+  <text class="sans lg" x="58" y="956">The gateway holds no Novada</text>
+  <text class="sans lg" x="58" y="971">credential of its own.</text>
+
+  <text class="sans note" x="40" y="1016">Verified locally: the two-container topology over a shared network namespace, the sidecar against Redis with AUTH, the task definition against the ECS schema. Not yet applied to an AWS account.</text>
+</svg>

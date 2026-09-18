@@ -1,0 +1,255 @@
+name: Synthetic Monitor
+
+# 4-layer synthetic monitor for mcp.novada.com (see monitoring/README.md for
+# the full picture — Layer A/UptimeRobot is owner-provisioned outside this
+# repo; this workflow drives Layer B (smoke), Layer C (stress), and Layer D
+# (full-tools probe)).
+#
+# THIS IS NOT A PR GATE. It never runs on push/pull_request — scheduled +
+# manual only, on purpose, so routine commits never burn NOVADA_TEST_KEY
+# budget or k6 minutes. Do not add a `push:`/`pull_request:` trigger here.
+#
+# Two cron schedules (Layer B smoke, Layer D probe) fan out to their jobs; Layer C
+# (stress) is manual-only (see its note below). GitHub Actions cron is ALWAYS UTC,
+# regardless of repo/org timezone settings.
+on:
+  workflow_dispatch:
+    inputs:
+      smoke_scrapers:
+        description: "Also execute one real Tier-3 scraper call in the smoke job (costs credits)"
+        type: boolean
+        default: false
+  schedule:
+    # Layer B (smoke): every 6 hours at :17 past the hour — an off-round
+    # minute so this doesn't land in the top-of-hour pile-up window that
+    # every other repo's "0 */6 * * *"/"0 * * * *" cron collides into on
+    # GitHub's shared runners.
+    - cron: "17 */6 * * *"
+    # Layer C (stress): NO daily schedule as of 2026-08-04. A 20-VU flood against
+    # prod trips the gateway rate-limiter BY DESIGN (~1000 GATEWAY_RATE_LIMITED
+    # telemetry rows per run) — which the HQ log-push reconciler then forwards to
+    # the customer-facing HQ log as junk. A rate-limit-verification load test does
+    # not need to run daily against customer prod → Layer C is manual-only now
+    # (workflow_dispatch). Re-run it on demand when validating the rate limiter.
+    # Layer D (full-tools probe): once daily at 00:17 UTC (~02:00 Berlin time
+    # in winter / CET; ~01:00 in CEST DST — this cron is DST-naive, GitHub
+    # Actions schedules don't shift with the clock, so the local wall-clock
+    # time drifts by ±1h across the DST boundary. Off-round :17 minute for the
+    # same anti-pile-up reason as Layer B, on a distinct minute from both
+    # other layers so all three never contend for the runner queue at once).
+    - cron: "17 0 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  # Gate: only run this job on ITS OWN cron, or on manual workflow_dispatch
+  # (which runs both jobs). github.event.schedule carries the exact cron
+  # expression that fired, so matching the literal string is the clean way
+  # to split one multi-schedule workflow into per-cadence jobs without a
+  # separate workflow file per layer.
+  smoke:
+    name: "Layer B — all-tools smoke (6h)"
+    # Self-guard: only run on the canonical repo. The post-commit hook mirrors
+    # main → NovadaLabs/test-novada-mcp-test, which has NO NOVADA_TEST_KEY secret,
+    # so the monitor failed on every mirror run (pure email noise, not a real
+    # outage). github.repository is the repo the run belongs to, so this skips
+    # every job on any mirror. (2026-07-28)
+    if: github.repository == 'NovadaLabs/Novada-mcp' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '17 */6 * * *')
+    runs-on: ubuntu-latest
+    # Job-level env so ALERT_WEBHOOK is readable via the `env` context in a
+    # step's condition below — GitHub Actions FORBIDS the secrets context
+    # inside a step condition (a "workflow file issue" that silently makes
+    # the whole workflow invalid, not just the one step — this is what broke
+    # this workflow from 2026-07-23 until this fix). The env context IS
+    # allowed in a step condition.
+    env:
+      ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # all-tools-smoke.mjs is dependency-free (Node ≥20 stdlib only) — no
+      # npm install needed. Cheap/free-tier tool calls only by default;
+      # SMOKE_SCRAPERS is only ever "1" here when this run was a manual
+      # workflow_dispatch with the "smoke_scrapers" input checked — scheduled
+      # runs never set it, so Tier-3 stays free/skipped on the routine 6h
+      # cadence. See monitoring/README.md cost rule.
+      # This repo (NovadaLabs/Novada-mcp) is PUBLIC — its Actions logs are
+      # world-readable. MONITOR_QUIET=1 makes all-tools-smoke.mjs suppress
+      # per-tool status lines (which name specific failing tools) from
+      # stdout; the full detail still lands in the gitignored, non-public
+      # monitoring/reports/*.json file. See monitoring/README.md's Privacy
+      # model section.
+      - name: Run all-tools smoke
+        env:
+          NOVADA_TEST_KEY: ${{ secrets.NOVADA_TEST_KEY }}
+          SMOKE_SCRAPERS: ${{ (github.event_name == 'workflow_dispatch' && inputs.smoke_scrapers) && '1' || '' }}
+          MONITOR_QUIET: "1"
+        run: node monitoring/smoke/all-tools-smoke.mjs
+
+      # No artifact upload — this repo is PUBLIC and artifacts are
+      # world-readable. The report stays local to the runner (gitignored,
+      # never uploaded) and is never published from this job; only Layer D's
+      # full-daily job delivers report data, and only privately (see
+      # monitoring/README.md's Privacy model section).
+
+      # Optional alert: only fires if ALERT_WEBHOOK is configured as a repo
+      # secret. If it's absent, GitHub's own failed-scheduled-run email/UI
+      # notification is the fallback (see monitoring/README.md).
+      - name: Alert on failure
+        if: failure() && env.ALERT_WEBHOOK != ''
+        run: |
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"Novada Synthetic Monitor: smoke job FAILED — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$ALERT_WEBHOOK"
+
+  stress:
+    name: "Layer C — k6 stress (daily)"
+    if: github.repository == 'NovadaLabs/Novada-mcp' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '23 4 * * *')
+    runs-on: ubuntu-latest
+    # See the `smoke` job's identical comment: job-level env is required so
+    # ALERT_WEBHOOK is readable via the `env` context in a step condition —
+    # the secrets context is forbidden there.
+    env:
+      ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+
+      # grafana/run-k6-action silently DROPS the key: it neither forwards the
+      # step `env:` into k6's `__ENV` nor honors the `-e` flag we passed via
+      # `flags:` — verified in the 2026-07-25 + 07-27 runs (the `-e` was in the
+      # command, k6 still threw "NOVADA_TEST_KEY required"). So run the k6
+      # binary DIRECTLY (setup-k6-action@v1 above puts it on PATH) and pass the
+      # key with `-e`; the secret is masked in Actions logs.
+      - name: Run k6 stress test
+        env:
+          NOVADA_TEST_KEY: ${{ secrets.NOVADA_TEST_KEY }}
+        run: |
+          mkdir -p monitoring/reports
+          k6 run \
+            -e NOVADA_TEST_KEY="$NOVADA_TEST_KEY" \
+            --summary-export=monitoring/reports/stress-summary-${{ github.run_id }}.json \
+            monitoring/stress/k6-stress.js
+
+      # No artifact upload — this repo is PUBLIC and artifacts are
+      # world-readable (see the `smoke` job's identical comment).
+
+      - name: Alert on failure
+        if: failure() && env.ALERT_WEBHOOK != ''
+        run: |
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"Novada Synthetic Monitor: stress job FAILED — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$ALERT_WEBHOOK"
+
+  full-daily:
+    name: "Layer D — full-tools probe (daily)"
+    if: github.repository == 'NovadaLabs/Novada-mcp' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '17 0 * * *')
+    runs-on: ubuntu-latest
+    # Prevents a manual workflow_dispatch from racing the daily cron (both
+    # match the job's `if:` above) — without this, two concurrent runs could
+    # each file a Linear issue/comment for the same day, producing double
+    # delivery.
+    # cancel-in-progress: false queues the second run instead of killing the
+    # first mid-probe (a half-finished probe is worse than a queued rerun).
+    concurrency:
+      group: full-daily
+      cancel-in-progress: false
+    # Job-level env: makes ALERT_WEBHOOK/LINEAR_API_KEY readable via the
+    # `env` context in step conditions below (the secrets context is
+    # forbidden there — see the `smoke` job's identical comment) AND
+    # available as plain OS env vars to every `run:` step in this job
+    # (job-level env is inherited by all steps unless a step overrides it).
+    # LINEAR_API_KEY is deliberately renamed from its secret name so the
+    # private-delivery step below reads a short, stable name.
+    env:
+      ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # render-report.py is the only step in this job that needs a dependency —
+      # full-tools-probe.mjs itself stays Node-stdlib-only, same as Layer B.
+      - name: Install openpyxl
+        run: pip install openpyxl
+
+      # One real, representative, safe (or dry-run) call per hosted tool —
+      # including every billable per-platform scraper. Exits non-zero ONLY on
+      # an OURS-domain (①/②) P0/P1 finding or a missing probe tool; a
+      # backend-only (③) finding, including a full scraper-platform outage,
+      # is reported but never fails this step — see the script's own header
+      # comment for the full classification rubric.
+      # This repo (NovadaLabs/Novada-mcp) is PUBLIC — its Actions logs are
+      # world-readable. MONITOR_QUIET=1 makes full-tools-probe.mjs suppress
+      # the per-tool table and the detailed SUMMARY line from stdout, leaving
+      # only a single non-revealing completion line (no tool names, domains,
+      # backend names, or severity breakdown). The full detail still lands in
+      # monitoring/reports/full-*.json, which is gitignored here and instead
+      # delivered PRIVATELY below (Linear only — see monitoring/README.md's
+      # Privacy model section).
+      - name: Run full-tools probe
+        env:
+          NOVADA_TEST_KEY: ${{ secrets.NOVADA_TEST_KEY }}
+          MONITOR_QUIET: "1"
+        run: node monitoring/smoke/full-tools-probe.mjs
+
+      # if: always() so a probe failure (non-zero exit above) still renders
+      # the report for private delivery instead of silently discarding it —
+      # same rationale as Layer B/C's "if: always()" report steps. This step
+      # MUST run before "Sync report to Linear" below — linear-sync.mjs
+      # uploads the `.xlsx` this step produces as a Linear file attachment.
+      - name: Render xlsx/csv report
+        if: always()
+        run: python3 monitoring/report/render-report.py
+
+      # No artifact upload — this repo is PUBLIC and artifacts are
+      # world-readable. The report data instead goes ONLY to PRIVATE Linear
+      # (next step, both as an inline summary and as a genuine file
+      # attachment) — never to this public repo's Actions UI. See
+      # monitoring/README.md's Privacy model section.
+
+      # Private Linear delivery: only runs if LINEAR_API_KEY is configured
+      # (guarded via the `env` context, not `secrets.*`, per the `if:`
+      # restriction noted above). Reads the just-rendered report and posts to
+      # Linear ONLY (team TongWu / project "Novada MCP — Daily Monitoring
+      # Loop" / label Wutong) — a new alert issue on any P0/P1/P2 finding, or
+      # a dated heartbeat comment on green days, each with the rendered
+      # `.xlsx` attached directly as a Linear file upload. Never fails the
+      # job — see linear-sync.mjs's own fail-soft contract (including for
+      # the attachment upload itself).
+      #
+      # LINEAR_SYNC_LIVE=1 arms the script's mutations (issueCreate/
+      # commentCreate/fileUpload) — linear-sync.mjs defaults to a DRY-RUN
+      # preview otherwise (see its own doc comment on why: an earlier version
+      # fired live on any run with a key present, which is what created
+      # TOW2-336 during local testing). Only CI, which is meant to actually
+      # deliver the daily report, sets this.
+      - name: Sync report to Linear
+        if: always() && env.LINEAR_API_KEY != ''
+        env:
+          LINEAR_SYNC_LIVE: "1"
+        run: node monitoring/report/linear-sync.mjs
+
+      - name: Alert on failure
+        if: failure() && env.ALERT_WEBHOOK != ''
+        run: |
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"Novada Synthetic Monitor: full-daily job FAILED (ours-domain P0/P1 or missing tool) — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$ALERT_WEBHOOK"

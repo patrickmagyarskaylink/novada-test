@@ -1,0 +1,220 @@
+# Local test stack for the Novada MCP hosted gateway.
+#
+#   cd docker && cp .env.example .env && docker compose up -d --build
+#   curl -s localhost:8080/health
+#
+# Everything is reached through Traefik on ONE host port (8080 by default).
+#   default profile   : traefik + gateway + redis + kv        ← minimum viable
+#   profile telemetry : + postgres + postgrest                (event log sink)
+#   profile ui        : + static landing pages (playground, chat)
+#   profile stdio     : builds the stdio image (not a long-running service)
+name: novada-mcp
+
+services:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Traefik — single entrypoint and the only published HTTP port. Routing table
+  # is a static file (docker/traefik/dynamic.yml), NOT the Docker provider: that
+  # would require mounting /var/run/docker.sock, i.e. host-daemon control, into
+  # an edge proxy. See docker/traefik/traefik.yml for the full reasoning.
+  # ───────────────────────────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.5.0
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+      # Router/service dashboard — unauthenticated, local only.
+      - "${TRAEFIK_DASHBOARD_PORT:-8090}:8080"
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # MCP gateway — the containerized hosted-server (Streamable HTTP on /mcp).
+  # Not published directly; Traefik is the only way in.
+  # Holds NO Novada credentials: every caller authenticates with their own key
+  # (?apikey=… or Authorization: Bearer …) and is billed on their own account.
+  # ───────────────────────────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+    image: novada-mcp:gateway
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      # — required —
+      KV_REST_API_URL: http://kv:80
+      KV_REST_API_TOKEN: ${KV_REST_API_TOKEN:-local-dev-token}
+      STUB_AUTH_WARNING_ACCEPTED: "true"   # operator ack; without it /mcp → 503
+      # — tuning —
+      FREE_PLAN_MONTHLY_QUOTA: ${FREE_PLAN_MONTHLY_QUOTA:-1000}
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NOVADA_API_BASE: ${NOVADA_API_BASE:-https://api.novada.com}
+      # — optional: OAuth 2.1 grant endpoints (base64 32-byte AES-256-GCM key).
+      #   Unset ⇒ /register /authorize /token fail closed; ?apikey=/Bearer still work.
+      OAUTH_ENC_KEY: ${OAUTH_ENC_KEY:-}
+      OAUTH_ISSUER: ${OAUTH_ISSUER:-}
+      # — optional: telemetry sink. Points at Traefik, which strips /rest/v1 and
+      #   forwards to PostgREST. Unset ⇒ fail-open no-op.
+      TELEMETRY_SUPABASE_URL: ${TELEMETRY_SUPABASE_URL:-}
+      TELEMETRY_SUPABASE_KEY: ${TELEMETRY_SUPABASE_KEY:-}
+      TELEMETRY_SUPABASE_SERVICE_KEY: ${TELEMETRY_SUPABASE_SERVICE_KEY:-}
+      NOVADA_LOG_IDENTITY_AES_KEY: ${NOVADA_LOG_IDENTITY_AES_KEY:-}
+      NOVADA_HQ_LOG_URL: ${NOVADA_HQ_LOG_URL:-}
+      CRON_SECRET: ${CRON_SECRET:-}
+      # — optional: error monitoring —
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    depends_on:
+      kv:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Redis — quota counters, per-IP rate limit, token-verify cache, OAuth codes.
+  # All keys are TTL'd; losing this volume costs counters, not customer data.
+  # ───────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # kv — Upstash-REST façade in front of plain Redis.
+  # api/mcp.ts talks to KV through @vercel/kv, which is @upstash/redis under the
+  # hood: an HTTP/REST protocol, NOT the Redis wire protocol. So a raw Redis (or
+  # ElastiCache) is not drop-in — it needs this translation layer. Dev-only
+  # third-party image; in AWS use Upstash (native REST) or run SRH as a sidecar.
+  # ───────────────────────────────────────────────────────────────────────────
+  kv:
+    image: hiett/serverless-redis-http:0.0.10
+    restart: unless-stopped
+    environment:
+      SRH_MODE: env
+      SRH_TOKEN: ${KV_REST_API_TOKEN:-local-dev-token}
+      SRH_CONNECTION_STRING: redis://redis:6379
+    expose:
+      - "80"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # OPTIONAL telemetry sink (profile: telemetry) — Supabase-shaped, self-hosted.
+  # _telemetry.ts POSTs to ${TELEMETRY_SUPABASE_URL}/rest/v1/mcp_events; Traefik's
+  # strip-rest-v1 middleware maps that onto PostgREST's /mcp_events. Enable with:
+  #   docker compose --profile telemetry up -d
+  # ───────────────────────────────────────────────────────────────────────────
+  telemetry-db:
+    profiles: ["telemetry"]
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-dev-postgres}
+      POSTGRES_DB: novada_telemetry
+    volumes:
+      - telemetry-data:/var/lib/postgresql/data
+      # Ordered init: roles, then the local baseline table (the in-repo migrations
+      # are ALTER-only — see 05-mcp-events-baseline.sql), then the real migrations.
+      - ./telemetry/00-roles.sh:/docker-entrypoint-initdb.d/00-roles.sh:ro
+      - ./telemetry/05-mcp-events-baseline.sql:/docker-entrypoint-initdb.d/05-baseline.sql:ro
+      - ../hosted-server/migrations/2026-07-23-mcp-events-log-schema.sql:/docker-entrypoint-initdb.d/10-mcp-events.sql:ro
+      - ../hosted-server/migrations/2026-08-26-mcp-events-push-status-dead.sql:/docker-entrypoint-initdb.d/20-push-status.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d novada_telemetry"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgrest:
+    profiles: ["telemetry"]
+    image: postgrest/postgrest:v12.2.3
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD:-local-dev-postgres}@telemetry-db:5432/novada_telemetry
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${TELEMETRY_JWT_SECRET:-novada-local-dev-jwt-secret-change-me-32b}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+    depends_on:
+      telemetry-db:
+        condition: service_healthy
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # OPTIONAL browser UI (profile: ui) — the landing pages against the LOCAL
+  # gateway, on the same origin, so no CORS is involved:
+  #   http://localhost:8080/playground   tool-by-tool JSON-RPC console
+  #   http://localhost:8080/chat         keyword-routed chat over the tools
+  #
+  # playground.html:223 and chat.html:860 hardcode the production endpoint. It is
+  # rewritten to the relative "/mcp" ONCE at container start, into a tmpfs copy —
+  # the repo files are mounted read-only and never modified. Refresh after editing
+  # a page: docker compose restart ui.
+  #
+  # Deliberately NOT rewritten: dashboard.html builds its URL from a template
+  # (`https://mcp.novada.com/${key}/mcp`) and the install snippets across the
+  # pages are copy-paste material for real clients — both keep pointing at prod.
+  #
+  # busybox httpd, not nginx: with clean-urls handled by a Traefik middleware,
+  # all this needs to be is a static file server.
+  # ───────────────────────────────────────────────────────────────────────────
+  ui:
+    profiles: ["ui"]
+    image: busybox:1.37.0
+    restart: unless-stopped
+    expose:
+      - "80"
+    volumes:
+      - ../hosted-server/landing:/src:ro
+    tmpfs:
+      - /site:exec
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        cp -a /src/. /site/
+        sed -i 's#https://mcp\.novada\.com/mcp#/mcp#g' /site/*.html
+        echo "[ui] serving $(ls /site/*.html | wc -l) pages, endpoint rewritten to /mcp"
+        exec httpd -f -v -p 80 -h /site
+    depends_on:
+      - gateway
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # stdio image (profile: stdio) — build/inspect only, not a service.
+  #   docker compose --profile stdio build stdio
+  #   docker compose run --rm stdio --list-tools
+  # ───────────────────────────────────────────────────────────────────────────
+  stdio:
+    profiles: ["stdio"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.stdio
+    image: novada-mcp:stdio
+    stdin_open: true
+    environment:
+      NOVADA_API_KEY: ${NOVADA_API_KEY:-}
+
+volumes:
+  redis-data:
+  telemetry-data:

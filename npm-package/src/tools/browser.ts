@@ -1,0 +1,422 @@
+import type { Page } from "playwright-core";
+import type { BrowserParams, BrowserAction } from "./types.js";
+import { resolveBrowserWs } from "../utils/credentials.js";
+import { getSession, storeSession, closeSession, listSessions, sanitizeBrowserError } from "../utils/browser.js";
+import { makeNovadaError, NovadaErrorCode } from "../_core/errors.js";
+import { wrapUntrusted } from "../utils/untrusted.js";
+
+interface ActionResult {
+  action: string;
+  status: "ok" | "error";
+  data?: string;
+  error?: string;
+}
+
+/**
+ * Interactive browser automation via Novada Browser API (CDP WebSocket).
+ * Chain multiple actions in a single call: navigate → click → type → screenshot.
+ *
+ * When session_id is provided, the browser page is reused across calls —
+ * maintaining cookies, localStorage, and login state. Sessions expire after
+ * 10 minutes of inactivity.
+ *
+ * Special actions:
+ * - close_session: explicitly close a named session and release resources
+ * - list_sessions: list all currently active session IDs
+ */
+export async function novadaBrowser(params: BrowserParams, apiKey?: string): Promise<string> {
+  const { actions, timeout, session_id: sessionId, country } = params;
+  const warnings: string[] = [];
+  if (country) {
+    warnings.push(`country accepted but not applied on this endpoint — do not rely on geo-routing (received: "${country}")`);
+  }
+
+  // Handle session management actions that don't need a browser connection
+  if (actions.length === 1) {
+    const action = actions[0];
+    if (action.action === "close_session") {
+      if (!sessionId) {
+        return "Error: close_session requires a session_id parameter.\n\nagent_instruction: Pass session_id to close_session. List active sessions first with list_sessions action to find valid IDs.";
+      }
+      const closed = await closeSession(sessionId);
+      return [
+        `## Session Closed`,
+        `session_id: ${sessionId}`,
+        `status: ${closed ? "closed" : "not_found"}`,
+        ``,
+        `## Agent Hints`,
+        `- Session resources released. Next call with this session_id will start a fresh cold connection (~8s).`,
+        `- Reuse active sessions across calls to avoid the cold-start cost (~1.5s warm vs ~8s cold).`,
+      ].join("\n");
+    }
+    if (action.action === "list_sessions") {
+      const ids = listSessions();
+      return [
+        `## Active Browser Sessions`,
+        `count: ${ids.length}`,
+        ``,
+        ids.length > 0 ? ids.map(id => `- ${id}`).join("\n") : "No active sessions.",
+        ``,
+        `## Agent Hints`,
+        `- Reuse sessions with session_id to avoid cold-start latency (~8s new session vs ~1.5s warm reuse).`,
+        `- Sessions expire after 10 min of inactivity — use close_session to release early.`,
+        `- Pass session_id across multiple browser calls to maintain login state (cookies, localStorage).`,
+      ].join("\n");
+    }
+  }
+
+  // resolveBrowserWs prefers: store.browserWs > NOVADA_BROWSER_WS > auto-fetch via apiKey.
+  // Passing apiKey here ensures the caller's account is billed on the hosted server.
+  const wsEndpoint = await resolveBrowserWs(apiKey);
+  if (!wsEndpoint) {
+    return [
+      `## Browser API — Not Configured`,
+      ``,
+      `Set the NOVADA_BROWSER_WS environment variable to enable browser automation,`,
+      `or provide a NOVADA_API_KEY with Browser API access (product=10) to auto-provision.`,
+      ``,
+      `Example:`,
+      `  claude mcp add novada \\`,
+      `    -e NOVADA_API_KEY=your_key \\`,
+      `    -e NOVADA_BROWSER_WS=wss://USER:PASS@YOUR_BROWSER_WS_HOST \\`,
+      `    -- npx -y novada-mcp`,
+      ``,
+      `Get credentials at: https://dashboard.novada.com/overview/browser/`,
+      ``,
+      `agent_instruction: Set NOVADA_BROWSER_WS or ensure NOVADA_API_KEY has Browser API access (product=10). Auto-provisioning will retry with the caller's key.`,
+    ].join("\n");
+  }
+
+  // Dynamic import to avoid forcing playwright-core on users who don't need browser
+  let chromium: typeof import("playwright-core").chromium;
+  try {
+    const pw = await import("playwright-core");
+    chromium = pw.chromium;
+  } catch {
+    return [
+      `## Browser API — Missing Dependency`,
+      ``,
+      `playwright-core is required for browser automation but not installed.`,
+      `Run: npm install playwright-core`,
+      ``,
+      `agent_instruction: Run: npm install playwright-core. This is required for browser automation.`,
+    ].join("\n");
+  }
+
+  const results: ActionResult[] = [];
+  const startTime = Date.now();
+  // G-2: shared across every action in this call — see executeAction's doc comment.
+  const pageCtx: { lastUrl?: string } = {};
+
+  // Try to reuse existing session page
+  const existingPage = sessionId ? getSession(sessionId) : null;
+
+  if (existingPage) {
+    // Reuse existing session — execute all actions on the same page
+    try {
+      existingPage.setDefaultTimeout(timeout);
+      for (const action of actions) {
+        const elapsed = Date.now() - startTime;
+        if (elapsed > timeout) {
+          results.push({ action: action.action, status: "error", error: `Timeout: ${timeout}ms exceeded` });
+          break;
+        }
+        try {
+          const result = await executeAction(existingPage, action, pageCtx);
+          results.push(result);
+        } catch (err) {
+          const errMsg = sanitizeBrowserError(err instanceof Error ? err.message : String(err));
+          // Dead page: evict session so the next call gets a fresh connection
+          const isPageDead = /closed|crashed|detached|Target closed/i.test(errMsg);
+          if (isPageDead && sessionId) {
+            await closeSession(sessionId).catch(() => {});
+            results.push({
+              action: action.action,
+              status: "error",
+              error: `${errMsg} — session "${sessionId}" evicted. Call novada_browser again to start a fresh session.`,
+            });
+            break; // no point continuing on a dead page
+          }
+          results.push({
+            action: action.action,
+            status: "error",
+            error: errMsg,
+          });
+        }
+      }
+    } catch (err) {
+      // Only reaches here if setDefaultTimeout() itself throws (rare)
+      results.push({ action: "session_reuse", status: "error", error: sanitizeBrowserError(err instanceof Error ? err.message : String(err)) });
+    }
+  } else {
+    // No existing session — create new browser connection
+    let browser;
+    let newPage;
+    try {
+      // Validate wsEndpoint format before attempting CDP connection
+      if (!wsEndpoint.startsWith("wss://")) {
+        throw makeNovadaError(
+          NovadaErrorCode.INVALID_PARAMS,
+          `NOVADA_BROWSER_WS must start with wss:// — got: [redacted]. Format: wss://username:password@host`,
+          "Set NOVADA_BROWSER_WS to a valid wss:// URL. Get credentials at https://dashboard.novada.com/overview/browser/",
+        );
+      }
+      if (!wsEndpoint.includes("@")) {
+        throw makeNovadaError(
+          NovadaErrorCode.INVALID_PARAMS,
+          "NOVADA_BROWSER_WS is missing credentials. Format: wss://username:password@host — get credentials from https://dashboard.novada.com/overview/browser/",
+          "Include username:password@ in the wss:// URL. Get credentials at https://dashboard.novada.com/overview/browser/",
+        );
+      }
+      browser = await chromium.connectOverCDP(wsEndpoint);
+      const context = await browser.newContext({
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      });
+      newPage = await context.newPage();
+      newPage.setDefaultTimeout(timeout);
+
+      // Store page in session if session_id provided
+      if (sessionId) {
+        storeSession(sessionId, newPage, browser, context);
+      }
+
+      for (const action of actions) {
+        const elapsed = Date.now() - startTime;
+        if (elapsed > timeout) {
+          results.push({ action: action.action, status: "error", error: `Timeout: ${timeout}ms exceeded` });
+          break;
+        }
+        try {
+          const result = await executeAction(newPage, action, pageCtx);
+          results.push(result);
+        } catch (err) {
+          const errMsg = sanitizeBrowserError(err instanceof Error ? err.message : String(err));
+          const isPageDead = /closed|crashed|detached|Target closed/i.test(errMsg);
+          if (isPageDead && sessionId) {
+            await closeSession(sessionId).catch(() => {});
+            results.push({
+              action: action.action,
+              status: "error",
+              error: `${errMsg} — session "${sessionId}" evicted. Call novada_browser again to start a fresh session.`,
+            });
+            break;
+          }
+          results.push({ action: action.action, status: "error", error: errMsg });
+        }
+      }
+
+      // Only close context/browser if NOT in a named session (session pages stay open)
+      if (!sessionId) {
+        await context.close();
+      }
+    } catch (err) {
+      // P0 SECURITY: sanitize WSS credentials from Playwright connection errors
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      const safeMsg = sanitizeBrowserError(rawMsg);
+      // If this is already a NovadaError (e.g. from validation above), re-throw as-is
+      if (err instanceof Error && err.name === "NovadaError") {
+        throw err;
+      }
+      // Connection failures → push as error result instead of throwing (keeps output format consistent)
+      results.push({
+        action: actions[0]?.action ?? "connect",
+        status: "error",
+        error: safeMsg,
+      });
+    } finally {
+      if (browser && !sessionId) {
+        await browser.close();
+      }
+    }
+  }
+
+  const elapsed = Date.now() - startTime;
+  const succeeded = results.filter(r => r.status === "ok").length;
+  const failed = results.length - succeeded;
+
+  const lines: string[] = [
+    `## Browser Session Results`,
+    `actions: ${results.length} | succeeded: ${succeeded} | failed: ${failed} | time: ${elapsed}ms${sessionId ? ` | session_id: ${sessionId} | session_active: true` : ""}`,
+    ``,
+  ];
+
+  if (warnings.length > 0) {
+    lines.push(`## Warnings`, JSON.stringify(warnings), ``);
+  }
+
+  lines.push(`---`, ``);
+
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    lines.push(`### Action ${i + 1}: ${r.action} [${r.status}]`);
+    if (r.error) {
+      lines.push(`Error: ${r.error}`);
+    } else if (r.data) {
+      // Truncate large outputs
+      const data = r.data.length > 10000 ? r.data.slice(0, 10000) + "\n<!-- truncated -->" : r.data;
+      lines.push(data);
+    }
+    lines.push(``);
+  }
+
+  lines.push(`---`, `## Agent Hints`);
+  if (sessionId) {
+    lines.push(`- Session active: session_id="${sessionId}" — reuse this ID in subsequent calls to maintain state (~1.5s warm vs ~8s cold start).`);
+    lines.push(`- Sessions expire after 10 minutes of inactivity — use close_session when done.`);
+  } else {
+    lines.push(`- Each browser call starts fresh (~8s cold start) — no cookies or state from prior calls.`);
+    lines.push(`- Use session_id to maintain state (login, cookies) across calls and get ~5x faster warm reuse (~1.5s).`);
+  }
+  lines.push(`- Chain actions to complete multi-step flows in one call.`);
+  lines.push(`- list_sessions shows all currently active session IDs.`);
+  lines.push(`- Geo-restrictions: TikTok is geo-restricted (e.g. banned in India); country targeting is not yet applied on this endpoint, so passing country has no effect here.`);
+  lines.push(`- SPA navigation: use wait_until="domcontentloaded" (default) for X/Twitter, TikTok, React apps. Never use "networkidle" for SPAs — they never reach networkidle and will timeout.`);
+  if (failed > 0) {
+    lines.push(`- Action failed. Recovery options:`);
+    lines.push(`  1. Use aria_snapshot action to see the current accessibility tree and find correct selectors.`);
+    lines.push(`  2. Use snapshot action to inspect the current HTML structure.`);
+    lines.push(`  3. Use evaluate action with script="document.querySelector('<selector>')" to test if element exists.`);
+  }
+
+  // PARAM-HONESTY: country is accepted but never applied to the Browser API's exit
+  // node (see the ## Warnings block above). Only fire when the caller actually
+  // supplied it, so agents who omit country see no extra noise.
+  //
+  // Review round 1 (HIGH): the original wording here overclaimed novada_extract as a
+  // clean workaround. novada_extract's country param ONLY applies on the render/js
+  // path (extract.ts fetchWithRender call sites) — its own DEFAULT render="auto" races
+  // a plain static fetch (fetchViaProxy, which has no country field at all) and a
+  // geo-blocked page is usually plain static HTML, so it won't escalate and country
+  // gets silently dropped there too (extract.ts now discloses that case itself — see
+  // the PARAM-HONESTY comments in extract.ts). Tightened to require render="render"
+  // (or "js") explicitly; kept the accurate render="browser" caveat.
+  if (country) {
+    lines.push(``);
+    lines.push(`agent_instruction: country="${country}" was accepted but not applied to the browser exit node — do not rely on it for geo-restricted content. novada_browser's Browser API has no per-call geo-routing today. If interactive automation isn't required, use novada_extract with country="${country}" AND render="render" (or render="js") instead — it routes render/js fetches through a real exit IP in that country; novada_extract's DEFAULT render="auto"/"static" path drops country just like this tool does, and render="browser" shares this same non-geo-routed Browser API path, so neither of those two modes will honor it either.`);
+  }
+
+  return lines.join("\n");
+}
+
+
+/**
+ * G-2: the source label for wrapUntrusted on page-derived actions
+ * (snapshot/aria_snapshot/evaluate). Deliberately NOT `page.url()` — Playwright's
+ * Page.url() is a real method on the live CDP page, but several existing test
+ * mock objects (browser.test.ts's createMockPage()) stub only the methods
+ * novadaBrowser called before G-2 and don't implement `.url()`, so calling it
+ * unconditionally threw "page.url is not a function" through those pre-existing
+ * tests. Tracked from the actions THIS call already saw instead — set on a
+ * successful `navigate`, carried forward across subsequent actions in the same
+ * call. Falls back to a generic label when no navigate has occurred yet (e.g. a
+ * session-reuse call that goes straight to snapshot).
+ */
+async function executeAction(page: Page, action: BrowserAction, ctx: { lastUrl?: string }): Promise<ActionResult> {
+  switch (action.action) {
+    case "navigate": {
+      await page.goto(action.url, {
+        waitUntil: action.wait_until ?? "domcontentloaded",
+        timeout: 30000,
+      });
+      const title = await page.title();
+      ctx.lastUrl = action.url;
+      return { action: "navigate", status: "ok", data: `Navigated to: ${title}` };
+    }
+
+    case "click": {
+      await page.click(action.selector);
+      return { action: "click", status: "ok", data: `Clicked: ${action.selector}` };
+    }
+
+    case "type": {
+      await page.fill(action.selector, action.text);
+      return { action: "type", status: "ok", data: `Typed ${action.text.length} chars into: ${action.selector}` };
+    }
+
+    case "screenshot": {
+      const buf = await page.screenshot({ fullPage: true, type: "png" });
+      const b64 = buf.toString("base64");
+      // Return full base64 for programmatic use; agents can decode or display as an image
+      return { action: "screenshot", status: "ok", data: `data:image/png;base64,${b64}` };
+    }
+
+    case "snapshot": {
+      const html = await page.content();
+      const truncated = html.length > 30000 ? html.slice(0, 30000) + "\n<!-- truncated -->" : html;
+      // G-2: wrap the page HTML; our own "Tip:" line stays outside the untrusted block.
+      return {
+        action: "snapshot",
+        status: "ok",
+        data: `${wrapUntrusted(truncated, ctx.lastUrl ?? "current browser page")}\n\n<!-- Tip: Use aria_snapshot for a semantic accessibility tree (~70% smaller, easier to parse) -->`,
+      };
+    }
+
+    case "aria_snapshot": {
+      // Use Playwright's ariaSnapshot() — returns YAML accessibility tree (v1.46+)
+      // Semantic stable refs by role+name, ~70% smaller than raw HTML
+      const yaml = await page.ariaSnapshot();
+      if (!yaml) {
+        // Our own placeholder — nothing fetched to wrap.
+        return { action: "aria_snapshot", status: "ok", data: "(no accessible content found on this page)" };
+      }
+      // G-2: the accessibility tree is derived directly from page content.
+      return { action: "aria_snapshot", status: "ok", data: wrapUntrusted(yaml, ctx.lastUrl ?? "current browser page") };
+    }
+
+    case "evaluate": {
+      const result = await page.evaluate(action.script);
+      const serialized = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      // G-2: evaluate() runs the caller's script IN the page and returns whatever the
+      // page's DOM/JS state yields — page-derived, wrap it.
+      return { action: "evaluate", status: "ok", data: wrapUntrusted(serialized, ctx.lastUrl ?? "current browser page") };
+    }
+
+    case "wait": {
+      const waitMs = action.ms ?? action.timeout ?? 5000;
+      if (action.selector) {
+        await page.waitForSelector(action.selector, { timeout: waitMs });
+        return { action: "wait", status: "ok", data: `Selector found: ${action.selector}` };
+      }
+      await page.waitForTimeout(waitMs);
+      return { action: "wait", status: "ok", data: `Waited ${waitMs}ms` };
+    }
+
+    case "scroll": {
+      const dir = action.direction ?? "down";
+      const scrollScript = {
+        down: "window.scrollBy(0, window.innerHeight)",
+        up: "window.scrollBy(0, -window.innerHeight)",
+        bottom: "window.scrollTo(0, document.body.scrollHeight)",
+        top: "window.scrollTo(0, 0)",
+      }[dir];
+      await page.evaluate(scrollScript);
+      return { action: "scroll", status: "ok", data: `Scrolled ${dir}` };
+    }
+
+    case "hover": {
+      await page.hover(action.selector);
+      return { action: "hover", status: "ok", data: `Hovered: ${action.selector}` };
+    }
+
+    case "press_key": {
+      if (action.selector) {
+        await page.focus(action.selector);
+      }
+      await page.keyboard.press(action.key);
+      return { action: "press_key", status: "ok", data: `Pressed: ${action.key}${action.selector ? ` (focused: ${action.selector})` : ""}` };
+    }
+
+    case "select": {
+      await page.selectOption(action.selector, action.value);
+      return { action: "select", status: "ok", data: `Selected "${action.value}" in: ${action.selector}` };
+    }
+
+    case "close_session":
+    case "list_sessions":
+      // These are handled before reaching executeAction
+      return { action: action.action, status: "error", error: "Session management actions must be the only action in the call." };
+
+    default:
+      return { action: "unknown", status: "error", error: `Unknown action: ${(action as { action: string }).action}. agent_instruction: Supported actions are: navigate, click, type, screenshot, snapshot, aria_snapshot, evaluate, wait, scroll, hover, press_key, select, close_session, list_sessions.` };
+  }
+}

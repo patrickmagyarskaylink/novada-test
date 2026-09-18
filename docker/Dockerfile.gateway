@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# novada-mcp — hosted gateway image (Streamable HTTP)
+#
+# Runs hosted-server/vercel/api/mcp.ts (auth + quota + rate-limit + telemetry)
+# on a plain node:http listener instead of a Vercel Function, over a freshly
+# vendored npm-package build. Same tool catalog, same dispatch core.
+#
+# Build context is the REPO ROOT (needs npm-package/ AND hosted-server/):
+#   docker build -f docker/Dockerfile.gateway -t novada-mcp:gateway .
+#
+# Runtime requirements (see docker/README.md):
+#   KV_REST_API_URL / KV_REST_API_TOKEN   Upstash-REST-compatible Redis (required)
+#   STUB_AUTH_WARNING_ACCEPTED=true       operator ack, else /mcp answers 503
+# The image holds NO Novada API key: api/mcp.ts deletes every server-side
+# consumption credential at load, each caller pays with their own key.
+###############################################################################
+
+ARG NODE_IMAGE=node:22.20.0-bookworm-slim
+ARG TSX_VERSION=4.23.13
+
+# ─── 1. mcp-build: compile npm-package → build/ (the vendored dispatch core) ──
+FROM ${NODE_IMAGE} AS mcp-build
+WORKDIR /src
+COPY npm-package/package.json npm-package/package-lock.json ./
+# --ignore-scripts: package.json has a `prepare` hook that runs the build; src/ is
+# not in the image yet at this point, so let the explicit build step below do it.
+RUN npm ci --ignore-scripts
+COPY npm-package/tsconfig.json npm-package/server.json ./
+COPY npm-package/src ./src
+COPY npm-package/scripts ./scripts
+RUN npm run build
+
+# ─── 2. gateway-deps: production node_modules for the Vercel function code ────
+FROM ${NODE_IMAGE} AS gateway-deps
+WORKDIR /app
+COPY hosted-server/vercel/package.json hosted-server/vercel/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
+# ─── 3. runtime ──────────────────────────────────────────────────────────────
+FROM ${NODE_IMAGE} AS runtime
+ARG TSX_VERSION
+ENV NODE_ENV=production \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    PORT=8080 \
+    HOST=0.0.0.0
+WORKDIR /app
+
+# api/*.ts is TypeScript and hosted-server/vercel/tsconfig.json is noEmit (Vercel
+# compiles it on the platform). tsx transpiles on load, so the container runs the
+# exact same sources the Vercel deploy does — no second, divergent build config.
+RUN npm install -g tsx@${TSX_VERSION} && npm cache clean --force
+
+COPY --from=gateway-deps /app/node_modules ./node_modules
+COPY hosted-server/vercel/package.json  ./package.json
+COPY hosted-server/vercel/tsconfig.json ./tsconfig.json
+COPY hosted-server/vercel/api           ./api
+
+# Vendor the fresh build exactly like hosted-server/scripts/sync-to-hosted.mjs:
+# build/* + the real package.json (HOSTED_VERSION and the ESM `type: module`
+# marker both derive from it — without it Node reads the vendored .js as CJS).
+COPY --from=mcp-build /src/build        ./vendor/novada-mcp
+COPY --from=mcp-build /src/package.json ./vendor/novada-mcp/package.json
+# ...plus a copy one level up: vendor/novada-mcp/config.js resolves its VERSION via
+# createRequire("../package.json"), which lands on vendor/package.json in this
+# layout (that is what the committed vendor/package.json shim is for). Copying the
+# REAL package.json here keeps the reported version from drifting off the build.
+COPY --from=mcp-build /src/package.json ./vendor/package.json
+
+COPY docker/gateway/server.mts ./server.mts
+
+# Vendor gate — the same guard sync-to-hosted.mjs applies: a partial or
+# broken-import vendor tree fails the BUILD, not production.
+RUN node -e "import('./vendor/novada-mcp/core.js').then(m=>{if(!Array.isArray(m.TOOLS)||m.TOOLS.length<20)throw new Error('core.TOOLS looks partial: '+m.TOOLS?.length);console.log('vendor gate: core.js ok, '+m.TOOLS.length+' tools')})" \
+ && node -e "import('./vendor/novada-mcp/tools/index.js').then(m=>{const n=Object.keys(m).length;if(n<50)throw new Error('tools barrel looks partial: '+n);console.log('vendor gate: tools barrel ok, '+n+' exports')})"
+
+USER node
+EXPOSE 8080
+
+# /health needs neither auth nor KV — safe as an LB/ECS health probe.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["tsx", "server.mts"]

@@ -1,0 +1,187 @@
+// Aggregates daily traffic consumption across all 4 flow-metered Novada proxy
+// products in parallel. static ISP is excluded — it's billed per-IP (lifecycle),
+// not by traffic volume, so /v1/static_flow/consume_log 404s even for accounts
+// with active static_house orders (confirmed via raw devApiPost smoke test).
+// Use novada_static_ip_mgmt or novada_account(section="plans") for static instead.
+
+import { z } from "zod";
+import { devApiParallel, withDateRangeCompat } from "../_core/developer_api.js";
+
+// ─── Endpoint Map ────────────────────────────────────────────────────────────
+
+const FLOW_ENDPOINTS = [
+  { key: "residential", path: "/v1/residential_flow/consume_log" },
+  { key: "isp",         path: "/v1/isp_flow/consume_log" },
+  { key: "mobile",      path: "/v1/mobile_flow/mobile_flow_use" },
+  { key: "datacenter",  path: "/v1/dc_flow/consume_log" },
+] as const;
+
+type ProductKey = (typeof FLOW_ENDPOINTS)[number]["key"];
+
+// ─── Schema & Types ──────────────────────────────────────────────────────────
+
+export const TrafficDailyParamsSchema = z.object({
+  start_time: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional()
+    .describe(
+      "Inclusive start date YYYY-MM-DD. Defaults to 7 days ago server-side. Tool emits both start_time AND strat_time for server typo-compat.",
+    ),
+  end_time: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional()
+    .describe("Inclusive end date YYYY-MM-DD. Defaults to today."),
+  products: z
+    .array(z.enum(["residential", "isp", "mobile", "datacenter", "static"]))
+    .optional()
+    .describe(
+      "Subset of proxy products to query. Omit to query all 4 flow-metered products (static ISP is billed per-IP, not by traffic — always returned as inapplicable rather than queried).",
+    ),
+}).strict();
+
+export type TrafficDailyParams = z.infer<typeof TrafficDailyParamsSchema>;
+
+export function validateTrafficDailyParams(
+  args: Record<string, unknown> | undefined,
+): TrafficDailyParams {
+  return TrafficDailyParamsSchema.parse(args ?? {});
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function sumList(list: unknown[]): number {
+  let sum = 0;
+  for (const item of list) {
+    if (item !== null && typeof item === "object") {
+      const obj = item as Record<string, unknown>;
+      const v =
+        obj.traffic_mb ??
+        obj.mb ??
+        obj.consume_mb ??
+        obj.total_mb ??
+        obj.value;
+      if (typeof v === "number") sum += v;
+    }
+  }
+  return sum;
+}
+
+function extractTotalMb(data: unknown): number {
+  if (data === null || data === undefined) return 0;
+  if (Array.isArray(data)) return sumList(data);
+  if (typeof data === "object") {
+    const obj = data as Record<string, unknown>;
+    for (const candidate of ["total_mb", "total", "consume_mb", "totalConsume"]) {
+      const v = obj[candidate];
+      if (typeof v === "number") return v;
+    }
+    const list = obj.list ?? obj.records ?? obj.items ?? obj.data;
+    if (Array.isArray(list)) return sumList(list);
+  }
+  return 0;
+}
+
+// ─── Tool Implementation ─────────────────────────────────────────────────────
+
+interface PerProductSummary {
+  status: "ok" | "error";
+  total_mb?: number;
+  raw?: unknown;
+  error?: string;
+  /** Set for "static" — it's billed per-IP, not by traffic volume, so no consume_log call is made. */
+  applicable?: boolean;
+  reason?: string;
+}
+
+/**
+ * Fan out daily traffic consumption queries across the 4 flow-metered Novada
+ * proxy products (residential, isp, mobile, datacenter) in parallel, then
+ * aggregate totals. Partial failures are tolerated — each product's outcome
+ * is reported independently in per_product[<name>] and errors[]. "static" is
+ * never queried — it's billed per-IP, not by traffic — and is reported as
+ * inapplicable instead.
+ */
+export async function novadaTrafficDaily(
+  params: TrafficDailyParams,
+  apiKey?: string,
+): Promise<string> {
+  const wantStatic = !params.products?.length || params.products.includes("static");
+  const selected = params.products?.length
+    ? FLOW_ENDPOINTS.filter(e =>
+        (params.products as ProductKey[]).includes(e.key),
+      )
+    : FLOW_ENDPOINTS;
+
+  // INC-191: Always send date range — the server returns code=10001 "Invalid parameter"
+  // when no dates are provided, even though docs say they're "optional".
+  // Default: last 7 days → today.
+  const now = new Date();
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const defaultStart = sevenDaysAgo.toISOString().slice(0, 10);
+  const defaultEnd = now.toISOString().slice(0, 10);
+
+  const baseBody: Record<string, unknown> = withDateRangeCompat({}, {
+    start: params.start_time ?? defaultStart,
+    end: params.end_time ?? defaultEnd,
+  });
+
+  const results = await devApiParallel(
+    selected.map(e => ({
+      key: e.key,
+      path: e.path,
+      body: e.key === "mobile"
+        ? { ...baseBody, day_or_hour: "2" }  // mobile endpoint requires day_or_hour; "2"=by day
+        : { ...baseBody },
+    })),
+    { apiKey },
+  );
+
+  const summary: Record<string, PerProductSummary> = {};
+  let totalMb = 0;
+  const errors: Array<{ product: string; error: string }> = [];
+
+  for (const r of results) {
+    if (r.ok) {
+      const total = extractTotalMb(r.data);
+      summary[r.key] = { status: "ok", total_mb: total, raw: r.data };
+      totalMb += total;
+    } else {
+      const errMsg = r.error ?? "unknown error";
+      summary[r.key] = { status: "error", error: errMsg };
+      errors.push({ product: r.key, error: errMsg });
+    }
+  }
+
+  if (wantStatic) {
+    summary.static = {
+      status: "ok",
+      applicable: false,
+      reason: "static ISP is billed per-IP (see novada_account section=\"plans\"), not by traffic volume",
+    };
+  }
+
+  const allFailed = selected.length > 0 && errors.length === selected.length;
+  const status: "ok" | "partial" | "all_failed" =
+    errors.length === 0 ? "ok" : allFailed ? "all_failed" : "partial";
+
+  return JSON.stringify(
+    {
+      status,
+      range: {
+        start_time: params.start_time ?? "(server default, ~7 days ago)",
+        end_time: params.end_time ?? "(server default, today)",
+      },
+      total_mb_across_products: totalMb,
+      per_product: summary,
+      errors: errors.length ? errors : undefined,
+      agent_instruction:
+        errors.length === 0
+          ? "Daily traffic aggregated across flow-metered products. Each per_product.raw contains the original per-day breakdown returned by the developer-api. static ISP (if requested) is reported separately as applicable:false — it's billed per-IP, not by traffic."
+          : "Some products failed — see errors[] for details. Successful products are in per_product[<name>].raw. Common cause: that product is not provisioned on this account.",
+    },
+    null,
+    2,
+  );
+}

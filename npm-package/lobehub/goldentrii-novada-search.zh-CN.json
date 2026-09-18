@@ -1,0 +1,24 @@
+{
+  "author": "Goldentrii",
+  "homepage": "https://github.com/Goldentrii/novada-mcp",
+  "identifier": "goldentrii-novada-search",
+  "locale": "zh-CN",
+  "manifest": "https://registry.npmjs.org/novada-search/latest",
+  "meta": {
+    "avatar": "🌐",
+    "tags": [
+      "网络搜索",
+      "网页抓取",
+      "数据提取",
+      "深度研究",
+      "代理IP",
+      "反机器人",
+      "地理定向",
+      "RAG",
+      "AI代理",
+      "网站爬取"
+    ],
+    "title": "Novada MCP — 网络搜索、提取、爬取与研究",
+    "description": "为 AI 代理提供实时互联网数据。支持 5 个搜索引擎（Google、Bing、DuckDuckGo、Yahoo、Yandex）、批量 URL 内容提取、网站爬取（BFS/DFS，支持路径过滤）、URL 结构发现，以及带引用来源的多步骤深度研究。通过 1亿+ 代理 IP 覆盖 195 个国家，具备反机器人绕过能力。内置 MCP Prompts 和 Resources，专为 AI 代理工作流优化。"
+  }
+}

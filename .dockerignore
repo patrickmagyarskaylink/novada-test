@@ -1,0 +1,48 @@
+# Build context hygiene — the Docker builds only need:
+#   npm-package/{package*.json,tsconfig.json,server.json,src,scripts}
+#   hosted-server/vercel/{package*.json,tsconfig.json,api}
+#   docker/
+# Everything else is excluded so the context stays small and cache-stable.
+
+.git
+.github
+.githooks
+**/node_modules
+**/.vercel
+**/build
+**/dist
+**/.next
+**/.DS_Store
+**/*.log
+
+# Never ship secrets into a build context
+**/.env
+**/.env.*
+!**/.env.example
+
+# Docs / assets / test material — not needed by any image
+docs
+distribution
+monitoring
+config
+scripts
+npm-package/tests
+npm-package/docs
+npm-package/eval
+npm-package/prompts
+npm-package/benchmark
+npm-package/skills
+npm-package/lobehub
+npm-package/.claude-plugin
+npm-package/*.md
+hosted-server/landing
+hosted-server/docs
+hosted-server/benchmark
+hosted-server/scripts
+hosted-server/worker
+hosted-server/vercel/test
+hosted-server/vercel/vendor
+hosted-server/vercel/*.md
+hosted-server/*.md
+**/*.png
+**/*.html

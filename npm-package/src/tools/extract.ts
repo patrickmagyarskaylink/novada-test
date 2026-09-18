@@ -1,0 +1,2467 @@
+import * as cheerio from "cheerio";
+import type { CheerioAPI } from "cheerio";
+import { fetchWithRetry, fetchViaProxy, fetchWithRender, extractMainContent, extractFullPageContent, extractTitleFrom, extractDescriptionFrom, extractLinksFrom, detectJsHeavyContent, detectBotChallenge, identifyAntiBot, fetchViaBrowser, isBrowserConfigured, extractStructuredDataFrom, scoreExtraction, qualityLabel, lookupDomain, extractFields, isPdfResponse, extractPdf, USER_AGENT, detectKuferAvailability, truncatePreservingTable, stripBoilerplate } from "../utils/index.js";
+import type { FieldResult } from "../utils/index.js";
+import { matchHeadingSectionWithReason } from "../utils/fields.js";
+import { saveOutput } from "../utils/output.js";
+import type { ExtractParams } from "./types.js";
+import { makeNovadaError, NovadaErrorCode, redactSecrets, summarizeAggregateError } from "../_core/errors.js";
+import { getCached, setCached } from "../_core/session-cache.js";
+import { getRouteHint, recordRouteSuccess } from "../_core/route-memory.js";
+import { TIMEOUTS } from "../config.js";
+import { CATALOG_BY_DOMAIN } from "../data/scraper_catalog.js";
+import { isBrowserAvailableOnRuntime, getBrowserUnavailableError } from "../utils/runtime.js";
+import { wrapUntrusted } from "../utils/untrusted.js";
+
+export { detectJsHeavyContent } from "../utils/index.js";
+
+/**
+ * Default character ceiling applied to extracted content when the caller does not
+ * pass max_chars. Matches docs (novada-mcp-documentation.md) and the extract test
+ * suite, and aligns with extractMainContent's internal 25000 cap so a default
+ * extraction never double-truncates. Hoisted to module scope so the single-URL
+ * path, the PDF slice, and any future call site share one source of truth.
+ */
+const MAX_CHARS_DEFAULT = 25000;
+
+/**
+ * F17 (2026-09-10 audit): extractMainContent has an INTERNAL default cap of 25000 chars.
+ * When extract.ts relied on it (clean=true path), the content arrived pre-capped and the
+ * flagged display-truncation check below (`displayContent.length > maxChars`) never
+ * fired — a silent ~25K truncation with the schema-promised `content_truncated:true` +
+ * `total_chars` flags never emitted (wikipedia row, eval F17). The PDF pre-slice was a
+ * second member of the same class. Fix: extract.ts call sites pass an effectively
+ * unbounded cap so the FLAGGED display truncation is the single truncation authority
+ * (matching extractFullPageContent, which has no internal cap at all) and `total_chars`
+ * reports the honest full length.
+ */
+const UNCAPPED_EXTRACT_CHARS = Number.MAX_SAFE_INTEGER;
+
+/**
+ * F15 (2026-09-10 audit): the readability/Turndown parse path can crash on hostile
+ * real-world markup (amazon.com/dp/B0CX23V2ZK → raw "TypeError: Cannot read properties
+ * of undefined (reading 'parentNode')" surfaced verbatim to the agent). Wrap the content
+ * extraction so a parser crash becomes a CLASSIFIED parse-failure (PARSE_FAILED) whose
+ * message getSuggestedFix recognizes — the fix bypasses the parser (format="html")
+ * instead of re-inviting the same crash or blaming access/rendering.
+ */
+function extractContentSafe(html: string, url: string, useFullPage: boolean): string {
+  try {
+    return useFullPage
+      ? extractFullPageContent(html, url)
+      : extractMainContent(html, url, UNCAPPED_EXTRACT_CHARS);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw makeNovadaError(
+      NovadaErrorCode.PARSE_FAILED,
+      `Content parse failed: the page's HTML crashed the readability/markdown parser (${detail}). ` +
+      `The fetch itself succeeded — this is a parser limitation on this page's markup, not an access or rendering problem.`,
+      `url:${url} parser crash in ${useFullPage ? "extractFullPageContent" : "extractMainContent"}`
+    );
+  }
+}
+
+/**
+ * F14 (2026-09-10 audit): the honest agent_instruction for a render escalation whose
+ * FETCH failed (401/5xx/thrown) — shared by the markdown path (via
+ * buildContextualAgentInstruction) and the JSON path so the two can never diverge.
+ * ASSERT_INVARIANT: never recommends render="render" — that mode just failed.
+ */
+function buildEscalationFailedInstruction(escalationError: string | null, browserConfigured: boolean): string {
+  const err = escalationError
+    ? ` (${redactSecrets(escalationError).replace(/\s+/g, " ").trim().slice(0, 200)})`
+    : "";
+  const alternatives = browserConfigured
+    ? `use render="browser" (Browser API via NOVADA_BROWSER_WS)`
+    : `set NOVADA_BROWSER_WS and use render="browser", verify the Web Unblocker is activated for this key (https://dashboard.novada.com/overview/web-unblocker/), or use format="html" to inspect the raw response`;
+  return `status:failed | auto-escalation to render FAILED${err} — the page needs JS rendering and the static content above is an empty shell, not the real page. render="render" was just attempted automatically and failed; do not send it again. Instead: ${alternatives}`;
+}
+
+/**
+ * Cross-tool hint map: base domain → the best novada_scrape operation for structured data.
+ * Used by both the JSON and markdown output paths, and by getSuggestedFix's error-path
+ * hint, to suggest novada_scrape when extraction quality is poor (P2-3). Single source
+ * of truth so all three hint sites can never drift from each other.
+ *
+ * FIX-2 (2026-07-30): Only list ops that are NOT backend_broken in the catalog. When the
+ * best op for a platform is broken, either point at the next working op (shein) or
+ * suppress the hint entirely (chatgpt — all ops broken).
+ *
+ * FIX-3 (2026-09-02, audit): FIX-2 validated STATUS but not EXISTENCE — isCatalogOpUsable
+ * (below) used to be isCatalogOpBroken, which returned false (= "not broken, hint is
+ * safe") for any domain/op pair ABSENT from the catalog entirely, not just ones marked
+ * backend_broken. That's fail-OPEN: a typo'd or stale entry here silently passed the
+ * gate and emitted a phantom `novada_scrape(platform=..., operation=...)` suggestion the
+ * backend would reject with 11006/11008. Full audit against scraper_catalog.ts (16
+ * platforms, ~87 ops) found three bad entries, now fixed:
+ *   - "reddit.com"    → removed. reddit.com is not a catalog domain at all (confirmed by
+ *                       resources/index.ts's own "NOT AVAILABLE — use novada_extract
+ *                       instead" list, and tests/data/scraper_catalog.test.ts's
+ *                       "unknown domain returns undefined" case). Also currently
+ *                       unreachable via extractSingleInner's own hint sites because
+ *                       rewriteRedditUrl() rewrites reddit.com/www.reddit.com to
+ *                       old.reddit.com BEFORE baseDomain is computed — but the map entry
+ *                       was wrong regardless of that incidental shadowing, and
+ *                       getSuggestedFix's error-path hint (below) reads the ORIGINAL
+ *                       (pre-rewrite) url, so a fetch-throws case there was reachable.
+ *   - "glassdoor.com" → removed. Same as reddit.com: not one of the 16 active catalog
+ *                       domains (also explicitly listed as "NOT AVAILABLE" in
+ *                       resources/index.ts) — genuinely reachable via the hint sites
+ *                       below (glassdoor.com has no compensating URL-rewrite).
+ *   - "instagram.com" → corrected "instagram_profile_url" (never existed in the catalog)
+ *                       to "ins_profiles_profileurl" (real, status:"ok", takes the same
+ *                       `profileurl` shape an agent already has). Live-reachable bug —
+ *                       verified by driving novadaExtract() end-to-end against a mocked
+ *                       low-quality instagram.com response.
+ * "twitter.com" is intentionally kept pointing at the x.com-only op "twitter_profile_username":
+ * scrape.ts's own PLATFORM_ALIASES resolves platform:"twitter.com" → "x.com" at call time,
+ * so the hint is genuinely actionable even though CATALOG_BY_DOMAIN has no "twitter.com"
+ * key — isCatalogOpUsable applies the same alias before checking the catalog (HINT_DOMAIN_ALIASES).
+ */
+export const SCRAPER_PLATFORMS: Record<string, string> = {
+  "amazon.com": "amazon_product_keywords",
+  "github.com": "github_repository_repo-url", "tiktok.com": "tiktok_posts_url",
+  "linkedin.com": "linkedin_company_information_url", "youtube.com": "youtube_video_search_label",
+  "instagram.com": "ins_profiles_profileurl", "twitter.com": "twitter_profile_username",
+  "x.com": "twitter_profile_username",
+  // shein_products_keyword is backend_broken; shein_product_url is alive — use that instead
+  "shein.com": "shein_product_url",
+  // chatgpt.com: both chatgpt_answer_searchterm and chatgpt_answer_url are backend_broken — suppress
+  // perplexity_answer_searchterm is ok
+  "perplexity.ai": "perplexity_answer_searchterm",
+};
+
+/**
+ * Domain aliases the generic novada_scrape tool resolves at call time (mirrors
+ * scrape.ts's own PLATFORM_ALIASES, currently `{ "twitter.com": "x.com" }`). scrape.ts
+ * does not export that table, so it is duplicated here — deliberately tiny (one entry)
+ * and referenced from both places via comment so it doesn't silently drift. Used ONLY to
+ * resolve a SCRAPER_PLATFORMS domain before validating it against the catalog; it has no
+ * effect on scrape.ts's actual runtime resolution.
+ */
+const HINT_DOMAIN_ALIASES: Record<string, string> = { "twitter.com": "x.com" };
+
+/**
+ * FAIL-CLOSED (FIX-3): true only when `op` is a real, non-backend_broken operation for
+ * `domain` (after alias resolution) in scraper_catalog.ts — the single source of truth
+ * for what novada_scrape can actually execute. A domain or op ABSENT from the catalog now
+ * returns false (suppress the hint) instead of the old isCatalogOpBroken's fail-open
+ * default of true-means-broken/false-means-safe, which treated "not found" the same as
+ * "confirmed working" (root cause of the reddit.com/instagram.com/glassdoor.com phantom
+ * hints — see the SCRAPER_PLATFORMS doc comment above).
+ */
+export function isCatalogOpUsable(domain: string, op: string): boolean {
+  const resolvedDomain = HINT_DOMAIN_ALIASES[domain] ?? domain;
+  const entry = CATALOG_BY_DOMAIN.get(resolvedDomain)?.get(op);
+  return entry !== undefined && entry.status !== "backend_broken";
+}
+
+/**
+ * Resolve the single-source-of-truth novada_scrape hint text for a domain, or null when
+ * SCRAPER_PLATFORMS has no entry or the catalog can't confirm it's usable. Shared by the
+ * two quality-hint emission sites and getSuggestedFix's error-path hint so there is
+ * exactly one place that decides "is this domain's scrape hint safe to show" — no more
+ * hand-duplicated per-domain override tables that can drift from SCRAPER_PLATFORMS
+ * (getSuggestedFix used to hardcode its own instagram.com/x.com/amazon.com/linkedin.com
+ * strings independently, which is how the instagram_profile_url phantom op survived in
+ * TWO places at once).
+ */
+export function getScrapeHint(domain: string): string | null {
+  const scraperOp = SCRAPER_PLATFORMS[domain];
+  if (!scraperOp || !isCatalogOpUsable(domain, scraperOp)) return null;
+  return `novada_scrape(platform="${domain}", operation="${scraperOp}")`;
+}
+
+/** Markdown annotation for a resolved field's source (used in the Requested Fields block). */
+function sourceAnnotation(source: FieldResult["source"]): string {
+  switch (source) {
+    case "jsonld":
+      return " *(from schema)*";
+    case "microdata":
+      return " *(microdata)*";
+    case "infobox":
+      return " *(infobox)*";
+    case "table":
+      return " *(table)*";
+    case "heading":
+      return " *(from heading)*";
+    case "llm":
+      return " *(llm)*";
+    default:
+      return " *(pattern)*";
+  }
+}
+
+/**
+ * Parse the per-page returned/total char counts and truncation flag out of a single
+ * extractSingle markdown/JSON result so the batch wrapper can surface consistent
+ * per-item flags without re-truncating. Best-effort: an error/timeout block (no
+ * recognizable content meta) is reported as not-truncated rather than crashing.
+ */
+function parseItemStats(content: string): { returnedChars: number; truncated: boolean; totalChars: number | null } {
+  const returnedChars = content.length;
+  // NOV-578 #4: match ONLY the extractor's own meta emission, never arbitrary page body.
+  // extractSingle emits truncation exactly two ways:
+  //   - markdown meta line:  `... | content_truncated:true | total_chars:N`  (pipe-separated)
+  //   - JSON field:          `"content_truncated": true, ... "total_chars": N`  (quoted key)
+  // The old loose regex (/content_truncated"?[:=]\s*true/i over the whole body, `=` allowed)
+  // also fired when a SCRAPED PAGE contained the string — e.g. a doc page about this very API,
+  // or a JSON sample — reporting phantom truncation and a wrong total_chars. Anchoring to the
+  // pipe-prefixed markdown token or the quoted-key JSON form decouples it from page content.
+  const truncated =
+    /\|\s*content_truncated:true\b/.test(content) ||        // markdown meta line
+    /"content_truncated"\s*:\s*true\b/.test(content);       // JSON field
+  let totalChars: number | null = null;
+  const totalMatch =
+    content.match(/\|\s*total_chars:(\d+)/) ||              // markdown meta line
+    content.match(/"total_chars"\s*:\s*(\d+)/);             // JSON field
+  if (totalMatch) totalChars = parseInt(totalMatch[1], 10);
+  return { returnedChars, truncated, totalChars };
+}
+
+/**
+ * Extract readable/structured content from a URL.
+ * Returns cleaned markdown, JSON fields, or summaries — content processed for agent consumption.
+ *
+ * Format guide:
+ *   - novada_extract(format="markdown") → readable/structured content (default).
+ *                       Best for: articles, docs, product pages, any page where you want processed text.
+ *   - novada_extract(format="html")  → raw HTML (full DOM source) for custom parsing or inspecting page structure.
+ *                       Best for: when you need the actual source, CSS-selector workflows, or debugging DOM.
+ *
+ * Handles Cloudflare, DataDome, JS-heavy SPAs automatically via auto-escalation.
+ */
+export async function novadaExtract(params: ExtractParams, apiKey?: string): Promise<string> {
+  // P1-6: Normalize url/urls into a list
+  const urlList: string[] = params.urls
+    ? params.urls
+    : Array.isArray(params.url)
+      ? params.url
+      : [params.url as string];
+  if (urlList.length > 10) {
+    throw makeNovadaError(
+      NovadaErrorCode.INVALID_PARAMS,
+      `Batch extract accepts at most 10 URLs per call. Received ${urlList.length}. Split into multiple calls.`,
+      `url_count:${urlList.length} exceeds max:10`
+    );
+  }
+
+  const isBatch = urlList.length > 1;
+
+  // Batch mode: array of URLs (via urls param or url array)
+  if (isBatch) {
+    const urls = urlList;
+    const results = await Promise.all(
+      urls.map((url, i) =>
+        extractSingle({ ...params, url }, apiKey)
+          .then(content => ({ i, url, content, ok: true, renderRetried: false }))
+          .catch(err => {
+            const rawMessage = err instanceof Error ? err.message : String(err);
+            const message = redactSecrets(rawMessage);
+            const fix = getSuggestedFix(url, rawMessage, params.render);
+            // FIX-B: PMC mirror hint — null (no-op) for every other host.
+            const pmcHint = getPmcMirrorHint(url);
+            const fullFix = pmcHint ? `${fix} | ${pmcHint}` : fix;
+            return { i, url, content: `Error: ${message}\n${fullFix}`, ok: false, renderRetried: false };
+          })
+      )
+    );
+
+    // F2: Per-URL render escalation for all-unresolved fields on static fetch.
+    // Trigger: ok=true AND extraction_quality:none AND mode:static AND fields were requested.
+    // Cost control: cap concurrent retries at 3; never retry if HTTP error or render was explicit.
+    // Guard requires render to be unset/auto (review MEDIUM-1): an explicit render:"render"
+    // already rendered, so a retry would be an identical duplicate charge.
+    if (params.fields && params.fields.length > 0 && (!params.render || params.render === "auto")) {
+      // Detect which results qualify for a render retry
+      const retryQueue = results.filter(r =>
+        r.ok &&
+        /\bextraction_quality:\s*none\b/.test(r.content) &&
+        /\bmode:\s*static\b/.test(r.content)
+      );
+      if (retryQueue.length > 0) {
+        // Cap: at most 3 retries per batch call to bound added latency (~10-15s each)
+        const RETRY_CAP = 3;
+        const toRetry = retryQueue.slice(0, RETRY_CAP);
+        const retried = await Promise.all(
+          toRetry.map(r =>
+            extractSingle({ ...params, url: r.url, render: "render" }, apiKey)
+              .then(content => ({ i: r.i, url: r.url, content, ok: true, renderRetried: true }))
+              .catch(() => {
+                // Retry failed — keep original + note the attempt
+                return { i: r.i, url: r.url, content: r.content + "\n\n*render retry attempted: failed*", ok: true, renderRetried: true };
+              })
+          )
+        );
+        // Replace original results only when retry resolved at least one field
+        for (const rr of retried) {
+          const resolved = !/\bextraction_quality:\s*none\b/.test(rr.content);
+          const idx = results.findIndex(r => r.i === rr.i);
+          if (idx !== -1) {
+            if (resolved) {
+              results[idx] = rr;
+            } else {
+              // Retry didn't resolve fields — keep original + note the attempt
+              results[idx] = {
+                ...results[idx],
+                content: results[idx].content + "\n\n*render retry attempted: fields still unresolved*",
+                renderRetried: true,
+              };
+            }
+          }
+        }
+      }
+    }
+
+    const successful = results.filter(r => r.ok).length;
+    const failed = results.length - successful;
+
+    // NOV-670: Return a COMPACT inline summary so agents don't drown in 62k+ tokens
+    // from concatenated full pages. Each item gets: url, ok/failed, title (extracted),
+    // availability_status (if present), and a short snippet (~max_chars/N chars).
+    // The full per-page content is still written to disk for recovery.
+    //
+    // NOV-563/568: Each extractSingle already honors max_chars (default MAX_CHARS_DEFAULT).
+    // We no longer re-truncate per page — instead we emit compact summaries inline and
+    // save full content to disk.
+
+    // Per-item snippet budget: divide max_chars across all URLs (min 500 chars per item)
+    const perItemBudget = Math.max(500, Math.floor((params.max_chars ?? MAX_CHARS_DEFAULT) / urls.length));
+
+    // Build compact summary table
+    const summaryLines: string[] = [
+      `## Batch Extract Results`,
+      `urls:${urls.length} | successful:${successful} | failed:${failed}`,
+      ``,
+    ];
+
+    // Extract title from content block (best-effort)
+    function extractTitleFromBlock(content: string): string {
+      const m = content.match(/^title:\s*(.+)$/m);
+      return m ? m[1].trim() : "(no title)";
+    }
+
+    // Extract availability_status from Kufer block (if present)
+    function extractAvailabilityFromBlock(content: string): string | null {
+      const m = content.match(/^availability_status:\s*(.+)$/m);
+      return m ? m[1].trim() : null;
+    }
+
+    // PARAM-HONESTY (review round 2, MEDIUM): the country-not-applied disclosure
+    // (## Warnings block / country_warning field, emitted by extractSingleInner) sits
+    // BEFORE the "---\n" separator this loop slices from below, then gets truncated
+    // away by perItemBudget for any realistically-sized page — types.ts explicitly
+    // promotes batch mode for cross-country price comparison, the single most
+    // country-sensitive use case, so silently losing the disclosure there defeats
+    // the whole point of this fix. Anchor on the exact phrase this file's own
+    // PARAM-HONESTY code emits (not a loose substring) so real scraped page content
+    // that happens to contain "accepted but not applied" can't false-positive.
+    function extractCountryNotAppliedFromBlock(content: string): boolean {
+      return /accepted but not applied — resolved via mode=/.test(content);
+    }
+
+    // F1: Consolidated fields summary table (≥3 URLs + fields requested).
+    // Parses each result to build one compact cross-URL comparison table at the top.
+    // Full detail sections remain below. Handles both markdown and JSON per-URL output.
+    if (urls.length >= 3 && params.fields && params.fields.length > 0) {
+      const fieldNames = params.fields;
+      const CELL_MAX = 60;
+      const truncCell = (v: string) => v.length > CELL_MAX ? v.slice(0, CELL_MAX - 1) + "…" : v;
+
+      // Parse a field value from one URL's result content (markdown format)
+      function parseFieldValueMarkdown(content: string, field: string): string {
+        // Section starts at "## Requested Fields" (or "## Requested Fields (none resolved)")
+        const sectionStart = content.indexOf("## Requested Fields");
+        if (sectionStart === -1) return "—";
+        const sectionEnd = content.indexOf("\n## ", sectionStart + 1);
+        const section = sectionEnd !== -1
+          ? content.slice(sectionStart, sectionEnd)
+          : content.slice(sectionStart);
+        // Line format: "fieldname: value *(source)* *(conf:X.XX)*" or "fieldname: — *(unresolved)*"
+        const lineRe = new RegExp(`^${field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\s*(.+)$`, "m");
+        const m = section.match(lineRe);
+        if (!m) return "—";
+        // Strip annotation tags like *(jsonld)* *(conf:0.95)* *(warning: ...)* for table display
+        const raw = m[1].trim();
+        if (raw.startsWith("—")) return "—";
+        const cleaned = raw
+          .replace(/\s*\*\([^)]*\)\*/g, "")    // *(tag)*
+          .replace(/\s*—\s*\*\([^)]*\)\*/g, "") // — *(tag)*
+          .trim();
+        return truncCell(cleaned || "—");
+      }
+
+      // Parse a field value from one URL's result content (JSON format)
+      function parseFieldValueJson(content: string, field: string): string {
+        try {
+          const parsed = JSON.parse(content) as Record<string, unknown>;
+          const fields = parsed.fields as Record<string, { value: unknown }> | null;
+          if (!fields || !(field in fields)) return "—";
+          const val = fields[field]?.value;
+          if (val === null || val === undefined) return "—";
+          const str = typeof val === "string" ? val : JSON.stringify(val);
+          return truncCell(str);
+        } catch {
+          return "—";
+        }
+      }
+
+      const parseFieldValue = params.format === "json" ? parseFieldValueJson : parseFieldValueMarkdown;
+
+      // Markdown table: | url | field1 | field2 | ...
+      const header = `| url | ${fieldNames.join(" | ")} |`;
+      const separator = `| --- | ${fieldNames.map(() => "---").join(" | ")} |`;
+      const tableRows: string[] = [header, separator];
+
+      for (const r of results) {
+        if (!r.ok) {
+          tableRows.push(`| ${truncCell(r.url)} | ${fieldNames.map(() => "error").join(" | ")} |`);
+          continue;
+        }
+        const cells = fieldNames.map(f => parseFieldValue(r.content, f));
+        tableRows.push(`| ${truncCell(r.url)} | ${cells.join(" | ")} |`);
+      }
+
+      summaryLines.push(`## Fields Summary`);
+      summaryLines.push(...tableRows);
+      summaryLines.push(``);
+    }
+
+    // PARAM-HONESTY: count items where country was supplied but the per-item block
+    // discloses it wasn't applied, so the aggregate ## Agent Hints below can point
+    // the agent at the retry workaround even though each item's own agent_instruction
+    // line is likely truncated out of THIS inline summary (still on disk, and still
+    // on the header line below either way).
+    let countryNotAppliedCount = 0;
+
+    // Build compact per-item rows
+    for (const r of results) {
+      const stats = parseItemStats(r.content);
+      const itemTitle = r.ok ? extractTitleFromBlock(r.content) : "FAILED";
+      const availability = r.ok ? extractAvailabilityFromBlock(r.content) : null;
+      const totalPart = stats.totalChars !== null ? ` | total_chars:${stats.totalChars}` : "";
+      const availPart = availability ? ` | availability:${availability}` : "";
+      const statusPart = r.ok ? "ok" : "failed";
+      // PARAM-HONESTY (review round 2, MEDIUM): surface on the HEADER line — which is
+      // never truncated — rather than relying on it surviving inside the per-item
+      // snippet slice below, which drops the ## Warnings block for any realistically
+      // sized page (see extractCountryNotAppliedFromBlock's doc comment).
+      const countryNotAppliedForItem = Boolean(params.country) && r.ok && extractCountryNotAppliedFromBlock(r.content);
+      if (countryNotAppliedForItem) countryNotAppliedCount++;
+      const countryPart = countryNotAppliedForItem ? ` | country_not_applied:true` : "";
+
+      summaryLines.push(`### [${r.i + 1}/${urls.length}] ${statusPart.toUpperCase()}: ${r.url}${countryPart}`);
+      summaryLines.push(`title: ${itemTitle}`);
+      summaryLines.push(`chars:${stats.returnedChars} | content_truncated:${stats.truncated}${totalPart}${availPart}`);
+
+      // Short snippet — strip the header block, take first perItemBudget chars of content
+      if (r.ok) {
+        const contentStart = r.content.indexOf("---\n");
+        const snippetSource = contentStart !== -1 ? r.content.slice(contentStart + 4) : r.content;
+        const snippet = snippetSource.slice(0, perItemBudget).trim();
+        if (snippet) {
+          summaryLines.push(``);
+          summaryLines.push(snippet + (snippetSource.length > perItemBudget ? "\n…" : ""));
+        }
+      } else {
+        summaryLines.push(``);
+        summaryLines.push(r.content.slice(0, 500));
+      }
+      summaryLines.push(``);
+      summaryLines.push(`---`);
+      summaryLines.push(``);
+    }
+
+    summaryLines.push(`## Agent Hints`);
+    if (failed > 0) {
+      summaryLines.push(`- ${failed} URL(s) failed. Re-run failed URLs individually for details.`);
+    }
+    // PARAM-HONESTY: batch-level agent_instruction equivalent — fires only when at
+    // least one item actually has the per-item country_not_applied:true header flag.
+    if (countryNotAppliedCount > 0) {
+      summaryLines.push(`- country="${params.country}" was accepted but NOT applied on ${countryNotAppliedCount} of ${urls.length} URL(s) above (see their header line) — do not rely on it for geo-restricted content there. Retry those URLs individually with render="render" (or render="js") and country="${params.country}" to have it actually honored; the default auto/static path drops it.`);
+    }
+    summaryLines.push(`- Inline content is a compact snippet (${perItemBudget} chars/item). Full content per page is saved to disk — see path: line below.`);
+    summaryLines.push(`- To get full content for a specific URL, call novada_extract with that single URL.`);
+    summaryLines.push(`- Use novada_map to discover additional pages on any of these domains.`);
+
+    // Build the full output for disk (the original full concatenation)
+    const fullLines: string[] = [
+      `## Batch Extract Results (Full)`,
+      `urls:${urls.length} | successful:${successful} | failed:${failed}`,
+      ``,
+      `---`,
+      ``,
+    ];
+    for (const r of results) {
+      fullLines.push(`### [${r.i + 1}/${urls.length}] ${r.url}`);
+      if (!r.ok) fullLines.push(`status: FAILED`);
+      const stats = parseItemStats(r.content);
+      const totalPart = stats.totalChars !== null ? ` | total_chars:${stats.totalChars}` : "";
+      fullLines.push(`returned_chars:${stats.returnedChars} | content_truncated:${stats.truncated}${totalPart}`);
+      fullLines.push(``);
+      fullLines.push(r.content);
+      fullLines.push(``);
+      fullLines.push(`---`);
+      fullLines.push(``);
+    }
+    const batchOutput = fullLines.join("\n");
+
+    // Best-effort: persist the FULL batch to disk; return compact summary inline.
+    // Agents that truncate long responses still see where the full result landed.
+    let batchPrefix = "";
+    try {
+      const firstUrl = urls[0];
+      const hint = (() => {
+        try { return `batch-${new URL(firstUrl).hostname.replace(/^www\./, "")}`; }
+        catch { return "batch"; }
+      })();
+      const outputResult = await saveOutput({
+        tool: "extract",
+        hint,
+        format: "md",
+        data: batchOutput,
+        project: params.project,
+      });
+      // FIX-1: Redact absolute path so home dir doesn't leak to hosted consumers.
+      batchPrefix = `path: ${redactSecrets(outputResult.filePath)}\n\n`;
+    } catch { /* best-effort */ }
+
+    // Return compact inline summary (NOV-670); full content is on disk at batchPrefix path
+    return batchPrefix + summaryLines.join("\n");
+  }
+
+  // Single URL mode
+  try {
+    return await extractSingle({ ...params, url: urlList[0] }, apiKey);
+  } catch (err) {
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const message = redactSecrets(rawMessage);
+    const suggestedFix = getSuggestedFix(urlList[0], rawMessage, params.render);
+    // FIX-B: PMC mirror hint — null (no-op) for every other host.
+    const pmcHint = getPmcMirrorHint(urlList[0]);
+    // F14 invariant: never advertise render="render" in the hints when the failed
+    // request already used the render tier (forced render/js, or a render-tier /
+    // render-bot-challenge error message) — that is the mode that just failed.
+    const renderAlreadyFailed =
+      params.render === "render" || params.render === "js" ||
+      /web unblocker error|web unblocker failed|render returned a bot challenge/i.test(rawMessage);
+    return [
+      `## Extract Failed`,
+      `url: ${urlList[0]}`,
+      ``,
+      `Error: ${message}`,
+      ``,
+      `## Agent Hints`,
+      `- If the URL returns JSON or binary data, it cannot be extracted as HTML.`,
+      `- If the URL is unreachable, check the domain and try novada_map first.`,
+      renderAlreadyFailed
+        ? `- render="render" was already attempted for this URL and failed — do not re-send it (see Agent Action below).`
+        : `- For JS-heavy pages returning empty content, try with render="render".`,
+      ``,
+      `## Agent Action`,
+      `agent_instruction: status:failed | ${suggestedFix}${pmcHint ? ` | ${pmcHint}` : ""}`,
+    ].join("\n");
+  }
+}
+
+/**
+ * NOV-672: Build a context-aware agent_instruction from the actual extraction outcome.
+ *
+ * Priority order (first matching rule wins):
+ * 1. fields requested & ≥half null → suggest render="render" for JS-rendered values
+ * 2. content_truncated → suggest raising max_chars
+ * 3. listing page (many rows/links, low prose) → suggest drilling into per-item URLs
+ * 4. success with content_ok → minimal success note
+ * 5. low quality → suggest render escalation
+ */
+function buildContextualAgentInstruction(ctx: {
+  contentOk: boolean;
+  qualityScore: number;
+  /** R4: display-level presence — true whenever usable content is in the payload
+   *  (incl. short-but-complete pages), independent of the numeric score threshold. */
+  contentPresent: boolean;
+  /** R4: page returned complete-but-brief prose (below the substantive threshold). */
+  shortButComplete: boolean;
+  usedMode: string;
+  renderMode: string;
+  fieldResults: import("../utils/index.js").FieldResult[] | null;
+  contentTruncated: boolean;
+  maxChars: number;
+  totalChars: number;
+  mainContent: string;
+  params: ExtractParams & { url: string };
+  /** F14: the auto render escalation ran (regardless of outcome). */
+  escalationAttempted: boolean;
+  /** F14: escalation ran and quality is still low (no better content adopted). */
+  escalationFailed: boolean;
+  /** F14: the escalation fetch itself failed/was unverifiable (throw, 401, challenge). */
+  escalationError: string | null;
+  browserConfigured: boolean;
+}): string {
+  const { contentOk, qualityScore, contentPresent, shortButComplete, usedMode, renderMode, fieldResults, contentTruncated, maxChars, totalChars, mainContent, params, escalationAttempted, escalationFailed, escalationError, browserConfigured } = ctx;
+
+  // FIX-B (2026-07-30): pmc.ncbi.nlm.nih.gov hard-blocks automated extraction — surface
+  // the free official mirror on every no-content/blocked outcome below. Hint-only:
+  // getPmcMirrorHint returns null (no-op) for every other host. Hoisted above the rule
+  // chain so the F14 escalation-failed branch (which must run FIRST) can carry it too.
+  const pmcHint = getPmcMirrorHint(params.url);
+  const withPmcHint = (base: string): string => (pmcHint ? `${base} | ${pmcHint}` : base);
+
+  // 0. F14 (2026-09-10 audit): a render escalation that ran and left the content bad is
+  // the FIRST thing the agent must know — and no rule below may recommend the render
+  // mode that was just tried (ASSERT_INVARIANT). Two honest shapes:
+  //   - the escalation fetch itself FAILED (401/5xx/challenge/non-HTML) → status:failed,
+  //     failure front-and-center; the shell content must not read as a success.
+  //   - the escalation fetch succeeded but returned NO BETTER content → honest
+  //     no_content that does not re-recommend render.
+  // Gated on !contentOk so a genuinely short-but-complete page (render succeeded and
+  // confirmed the page really is just short) still falls through to the success rules.
+  if (escalationFailed && !contentOk) {
+    if (escalationError) {
+      return withPmcHint(buildEscalationFailedInstruction(escalationError, browserConfigured));
+    }
+    const alternatives = browserConfigured
+      ? `use render="browser" (Browser API via NOVADA_BROWSER_WS)`
+      : `set NOVADA_BROWSER_WS and use render="browser", or use format="html" to inspect the raw response`;
+    return withPmcHint(`status:no_content | auto-escalation to render was attempted and returned no better content — do not send render="render" again. Instead: ${alternatives}`);
+  }
+
+  // 1. Fields requested with ≥ half null → JS-rendered values likely missing
+  if (fieldResults && fieldResults.length > 0) {
+    const unresolvedCount = fieldResults.filter(r => r.source === "unresolved").length;
+    if (unresolvedCount >= fieldResults.length / 2) {
+      // F14 invariant: never recommend a render retry when the escalation already ran.
+      const fieldsAdvice = escalationAttempted
+        ? `values may be JS-rendered but an automatic render="render" attempt did not resolve them`
+        : `values may be JS-rendered; retry with render="render" to fetch dynamic content`;
+      return `status:partial_fields | ${unresolvedCount}/${fieldResults.length} fields null — ${fieldsAdvice}`;
+    }
+  }
+
+  // 2. Content truncated → suggest raising max_chars
+  if (contentTruncated) {
+    const suggestedHigher = Math.min(maxChars * 2, 100000);
+    return `status:truncated | showing ${maxChars} of ${totalChars} chars — pass max_chars=${suggestedHigher} to retrieve more content`;
+  }
+
+  // 3. Listing page detection: many markdown table rows or many list items, short avg line
+  if (contentOk) {
+    const tableRowCount = (mainContent.match(/^\|/gm) ?? []).length;
+    const listItemCount = (mainContent.match(/^- /gm) ?? []).length;
+    const isListingPage = tableRowCount >= 10 || listItemCount >= 15;
+    if (isListingPage) {
+      return `status:success | listing page detected — extract individual item URLs for detailed data on each entry`;
+    }
+  }
+
+  // 4. Success with good content. R4: a short-but-complete page is a success, not
+  // a low-quality verdict — emit an informational note, never a "retry render" fix.
+  if (contentOk) {
+    if (shortButComplete) {
+      // F14 invariant: when the auto-escalation already ran (and merely confirmed the
+      // page is short), never suggest re-running the mode that was just tried.
+      const shortAdvice = escalationAttempted
+        ? `an automatic render="render" attempt did not add content — the page really is this short`
+        : `retry render="render" only if you expected more`;
+      return `status:success | note: short page (${mainContent.trim() ? mainContent.trim().split(/\s+/).length : 0} words) — complete but brief; ${shortAdvice}`;
+    }
+    return `status:success`;
+  }
+
+  // 5. Content genuinely absent (empty / bot-challenge / JS-empty) → escalation helps.
+  // R4: only reached when content is NOT present, so "retry render" is honest here
+  // (the F14 rule-0 branch above already intercepted every attempted-escalation case,
+  // so render has NOT been tried when these fire).
+  if (!contentPresent && usedMode === "static" && renderMode === "auto") {
+    return withPmcHint(`status:no_content | page returned no usable content — retry with render="render" for JS-heavy or bot-protected pages`);
+  }
+
+  // 6. Generic no-content on static.
+  if (!contentPresent && usedMode === "static") {
+    return withPmcHint(`status:no_content | retry with render="render"`);
+  }
+
+  return withPmcHint(`status:no_content quality:${qualityScore}/100`);
+}
+
+/**
+ * Derive a suggested_fix hint from a URL + error message.
+ *
+ * F14 ASSERT_INVARIANT (2026-09-10 audit): the suggested fix must NEVER recommend the
+ * render mode that just failed. `attemptedRender` carries the caller's render param —
+ * when the failed request was itself render/js, ANY branch below that resolves to a
+ * positive render="render" recommendation is intercepted and replaced with an honest
+ * alternative. Enforced at the wrapper so no current or future branch can violate it.
+ */
+export function getSuggestedFix(url: string, errorMsg: string, attemptedRender?: string): string {
+  const fix = deriveSuggestedFix(url, errorMsg);
+  const renderWasAttempted = attemptedRender === "render" || attemptedRender === "js";
+  if (renderWasAttempted && /render="render"/i.test(fix) && !/do not/i.test(fix)) {
+    return `suggested_fix: render="render" is the mode that just failed — do not re-send it. Try render="static" (plain fetch), render="browser" with NOVADA_BROWSER_WS configured, or novada_extract(url="${url}", format="html") for raw HTML`;
+  }
+  return fix;
+}
+
+function deriveSuggestedFix(url: string, errorMsg: string): string {
+  const lower = errorMsg.toLowerCase();
+  // FIX-A (2026-07-30): the aggregate-fetch-failure marker text is emitted ONLY by
+  // summarizeAggregateError's crafted message ("All N fetch strategies failed: ...").
+  // Must be checked FIRST — a distinct cause quoted verbatim inside that message can
+  // itself contain "403"/"blocked"/"bot"/etc., which would otherwise match a LATER,
+  // more generic branch below and produce a less accurate fix for a total-failure case.
+  if (lower.includes("fetch strategies failed")) {
+    return `suggested_fix: retry_recommended after 30s (use exponential backoff for repeated retries). If it persists, the site likely blocks both the datacenter proxy and the web unblocker — try render="browser" (novada_browser with NOVADA_BROWSER_WS configured), or accept the URL is currently unavailable`;
+  }
+  // P0: 5001 / PRODUCT_UNAVAILABLE — Web Unblocker not activated.
+  // Must be checked FIRST: the 5001 message contains "render/JS modes" which would
+  // otherwise match the generic "js" branch below and incorrectly suggest re-using
+  // render="render" — the very mode that just triggered the 5001.
+  if (lower.includes("5001") || lower.includes("retrying will not help")) {
+    return `suggested_fix: Web Unblocker not activated on this account. Activate at https://dashboard.novada.com/overview/web-unblocker/ or retry with render="static" (no unblocker needed)`;
+  }
+  // F15 (2026-09-10 audit): a classified parse crash (extractContentSafe above). The
+  // fetch succeeded — recommending a render retry re-runs the SAME crashing parser on
+  // the same markup and misdiagnoses the failure as an access problem. format="html"
+  // returns the raw DOM without the readability/Turndown pass (the failing component).
+  // Checked BEFORE the generic keyword branches so no substring of the underlying
+  // TypeError can route this to a misleading render/bot suggestion.
+  if (lower.includes("content parse failed")) {
+    let scrapePart = "";
+    try {
+      const host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+      const scrapeHint = getScrapeHint(host);
+      if (scrapeHint) scrapePart = `, or use ${scrapeHint} for structured ${host} data`;
+    } catch { /* ignore */ }
+    return `suggested_fix: the page fetched fine but crashed the HTML-to-markdown parser. Use novada_extract(url="${url}", format="html") for the raw page HTML (bypasses the parser) and parse it yourself${scrapePart}. Do not repeat the same call — the parser will crash on the same markup again`;
+  }
+  // F14: the Web Unblocker (render tier) ITSELF failed — never re-recommend the mode
+  // that just failed. These message forms are emitted only by fetchWithRender
+  // (utils/http.ts): "Web Unblocker error (NNN): …" / "Web Unblocker failed after retries".
+  if (lower.includes("web unblocker error") || lower.includes("web unblocker failed")) {
+    return `suggested_fix: the Web Unblocker (render tier) itself failed — do not re-send render="render". Verify the key/entitlement (novada_account section="summary", or https://dashboard.novada.com/overview/web-unblocker/), then try render="static" for a plain fetch, render="browser" with NOVADA_BROWSER_WS configured, or novada_extract(url="${url}", format="html") for raw HTML`;
+  }
+  // P1: render mode itself returned a bot-challenge page — do NOT suggest render="render"
+  // again (it was just tried and returned the challenge). Escalate to browser or unblock.
+  if (lower.includes("render returned a bot challenge") || lower.includes("bot challenge page")) {
+    return `suggested_fix: render mode returned a bot-challenge page — do not retry with render="render". Try: render="browser" with NOVADA_BROWSER_WS configured, or novada_extract(url="${url}", format="html") for raw HTML via stealth browser`;
+  }
+  // Known anti-bot / access-denial patterns
+  if (lower.includes("bot") || lower.includes("challenge") || lower.includes("captcha") ||
+      lower.includes("cloudflare") || lower.includes("403") || lower.includes("forbidden") ||
+      lower.includes("access denied") || lower.includes("blocked")) {
+    return `suggested_fix: retry with render="render" (JS rendering + anti-bot bypass). If that also fails: novada_extract(url="${url}", format="html") returns raw HTML via stealth browser — parse the response body manually`;
+  }
+  if (lower.includes("all promises were rejected") || lower.includes("eai_again") ||
+      lower.includes("econnrefused") || lower.includes("enotfound") || lower.includes("timeout")) {
+    return `suggested_fix: domain may be unreachable or rate-limiting (transient). Verify the URL is correct, then retry — retry with render="render" if a plain fetch keeps failing. If it persists, run novada_account(section="summary") to check API status`;
+  }
+  if (lower.includes("js") || lower.includes("javascript") || lower.includes("js-heavy")) {
+    return `suggested_fix: retry with render="render" for JavaScript-rendered pages`;
+  }
+  // Domain-specific overrides
+  try {
+    const host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    if (host === "zhihu.com") return `suggested_fix: zhihu.com blocks automated access. Use render="render" first; if blocked, use format="html" for raw HTML. Alternatively search via novada_search`;
+    // FIX-3 (2026-09-02, audit): derive from the single SCRAPER_PLATFORMS source (validated
+    // against scraper_catalog.ts via getScrapeHint) instead of a second, independently
+    // hand-maintained per-domain table. The old hardcoded instagram.com override above
+    // pointed at "instagram_profile_url" — a phantom op that never existed in the
+    // catalog — the SAME root cause as the reddit.com/glassdoor.com SCRAPER_PLATFORMS
+    // bug, just duplicated into a second call site. A single source means this can't
+    // drift from the two quality-hint sites again.
+    const scrapeHint = getScrapeHint(host);
+    if (scrapeHint) return `suggested_fix: try ${scrapeHint} for structured ${host} data`;
+  } catch { /* ignore */ }
+  return `suggested_fix: retry with render="render" for JS-heavy pages. If blocked: novada_extract(url="${url}", format="html") returns raw HTML via stealth browser`;
+}
+
+/**
+ * FIX-B (2026-07-30): pmc.ncbi.nlm.nih.gov hard-blocks automated extraction
+ * (reCAPTCHA on the static fetch; the Web Unblocker render tier 503s on this host).
+ * PMC full texts are freely available via two official mirrors that are NOT blocked
+ * the same way: europepmc.org (same PMCID, different host) and NCBI E-utilities
+ * efetch. This is a HINT ONLY — no auto-reroute this round (owner decision,
+ * 2026-07-30) — so a blocked/failed extraction can tell the agent where the free
+ * mirror lives instead of leaving it to guess "可能是限流" again.
+ *
+ * Matches both the modern host (pmc.ncbi.nlm.nih.gov) and the legacy path
+ * (www.ncbi.nlm.nih.gov/pmc/...). The PMCID regex is a fixed literal run against
+ * the URL string — never constructed from caller input — so no additional
+ * MCP-param RegExp hardening is needed.
+ *
+ * @returns null for non-PMC hosts or unparsable URLs (never throws).
+ */
+export function getPmcMirrorHint(url: string): string | null {
+  let host: string;
+  let pathname: string;
+  try {
+    const parsed = new URL(url);
+    host = parsed.hostname.toLowerCase();
+    pathname = parsed.pathname.toLowerCase();
+  } catch {
+    return null;
+  }
+  const isPmc =
+    host === "pmc.ncbi.nlm.nih.gov" ||
+    (host === "www.ncbi.nlm.nih.gov" && pathname.includes("/pmc"));
+  if (!isPmc) return null;
+
+  const pmcid = url.match(/PMC\d+/)?.[0];
+  if (pmcid) {
+    return `mirror_hint: pmc.ncbi.nlm.nih.gov blocks automated extraction (reCAPTCHA on static, 503 on render). Free official mirror with the same content: https://europepmc.org/article/PMC/${pmcid} — or NCBI E-utilities efetch with id=${pmcid}.`;
+  }
+  return `mirror_hint: pmc.ncbi.nlm.nih.gov blocks automated extraction (reCAPTCHA on static, 503 on render). Free official mirrors: europepmc.org (search by PMCID) or NCBI E-utilities efetch.`;
+}
+
+function rewriteRedditUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if ((host === "reddit.com" || host === "www.reddit.com") && !url.includes("old.reddit.com")) {
+      parsed.hostname = "old.reddit.com";
+      return parsed.toString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #1/#12: Keep the best result across escalation attempts.
+ *
+ * In render="auto" the static fetch can already hold real content; escalating to the
+ * browser/CDP tier then unconditionally overwrote `html` with the browser response.
+ * When that response is empty or a JS-challenge stub, the good static content was lost
+ * and the request returned near-empty (quality ~1/100, content_present:false).
+ *
+ * This compares the candidate (browser) HTML against the current best by the SAME
+ * extracted-content quality score the formatter uses, and only adopts the candidate
+ * when it is genuinely better. A blank/whitespace candidate is never adopted, so a
+ * non-empty static attempt always survives a failed escalation.
+ *
+ * Returns the winning html + which mode produced it, so callers set usedMode to match
+ * the content they actually kept (not the tier they merely attempted).
+ */
+function pickBetterHtml(
+  current: { html: string; mode: "static" | "render" | "browser" | "render-failed" },
+  candidate: { html: string; mode: "static" | "render" | "browser" },
+  url: string,
+  useFullPage: boolean
+): { html: string; mode: "static" | "render" | "browser" | "render-failed"; adopted: boolean } {
+  // A blank/near-blank candidate can never beat a fetched current result.
+  if (!candidate.html || candidate.html.trim().length === 0) {
+    return { ...current, adopted: false };
+  }
+  // F15: score crash-safely. A candidate whose DOM crashes the readability/Turndown
+  // parser must never crash the whole request out of an escalation comparison — it
+  // scores -1 (can never win). Symmetrically, if the CURRENT html is the one that
+  // crashes, a parseable candidate wins the comparison and rescues the request.
+  const scoreOf = (h: string, mode: "static" | "render" | "browser" | "render-failed"): number => {
+    try {
+      const main = useFullPage
+        ? extractFullPageContent(h, url)
+        : extractMainContent(h, url, UNCAPPED_EXTRACT_CHARS);
+      return scoreExtraction(h, main, mode, false).score;
+    } catch {
+      return -1;
+    }
+  };
+  const currentScore = scoreOf(current.html, current.mode);
+  const candidateScore = scoreOf(candidate.html, candidate.mode);
+  // Strictly-greater: ties keep the cheaper/earlier attempt (mode bonus already favors static).
+  if (candidateScore > currentScore) {
+    return { html: candidate.html, mode: candidate.mode, adopted: true };
+  }
+  return { ...current, adopted: false };
+}
+
+/**
+ * NOV-GB1 / NOV-GB2: GitBook .md fallback.
+ *
+ * GitBook hosts serve raw markdown at <page>.md — a free, no-JS-needed path that
+ * bypasses ALL rendering. This is critical on the hosted (Vercel serverless) endpoint,
+ * where render mode 503s and browser mode is unavailable (no persistent CDP WebSocket).
+ * On such runtimes the escalation ladder would otherwise short-circuit to a
+ * "Browser Mode Unavailable" error and never surface the docs content at all.
+ *
+ * Detection gate — conservative, will NOT trigger on normal pages:
+ *   (1) staticHtml contains "static-2v.gitbook.com" OR "api.gitbook.com/cache/" OR
+ *       "gitbook-x-prod.appspot.com" — GitBook-specific CDN assets that appear in
+ *       ALL GitBook-hosted sites and NOWHERE else.
+ *       NOTE (NOV-GB2): we do NOT gate on detectJsHeavyContent — modern GitBook ships a
+ *       ~500KB shell with no "__next"/"id=root" markers, so detectJsHeavyContent returns
+ *       FALSE and the old gate never fired. The CDN signature alone is the correct gate:
+ *       if a page is served by GitBook, its .md sibling is authoritative content.
+ *   (2) URL does not already end in .md.
+ *   (3) URL has a non-root path (can't append .md to a bare origin/).
+ *
+ * .md result accepted only when: content-type is text/markdown (or text/plain) AND
+ * length > 200 chars (GitBook "Page Not Found" stubs are ~100-200 chars).
+ *
+ * @returns the raw markdown + a lightweight synthetic HTML wrapper (so downstream
+ *          title/link/score helpers still work), or null when the fallback does not apply.
+ */
+async function attemptGitBookMdFallback(
+  pageUrl: string,
+  staticHtml: string
+): Promise<{ md: string; html: string } | null> {
+  if (!staticHtml || staticHtml.startsWith("pdf_pages:") || pageUrl.endsWith(".md")) return null;
+  const htmlLower = staticHtml.toLowerCase();
+  const isGitBook =
+    htmlLower.includes("static-2v.gitbook.com") ||
+    htmlLower.includes("api.gitbook.com/cache/") ||
+    htmlLower.includes("gitbook-x-prod.appspot.com");
+  if (!isGitBook) return null;
+
+  let mdUrl: string;
+  try {
+    const parsed = new URL(pageUrl);
+    const path = parsed.pathname.replace(/\/+$/, "");
+    if (!path || path === "/") return null; // root path — nothing to append .md to
+    mdUrl = `${parsed.origin}${path}.md`;
+  } catch {
+    return null;
+  }
+
+  try {
+    const mdResp = await fetchWithRetry(mdUrl, { tool: "extract", timeout: 8000 });
+    const mdCt = String((mdResp.headers as Record<string, string>)?.["content-type"] ?? "");
+    const mdBody = typeof mdResp.data === "string" ? mdResp.data : "";
+    // Accept markdown responses that are longer than a "Page Not Found" stub AND look like
+    // real docs. Structural check (review MEDIUM #2): require a markdown heading or a
+    // non-trivial word count so a verbose text/plain custom-404 can't inject garbage as
+    // page content. GitBook's own "Page Not Found" stub has neither an H1 nor 40+ words.
+    const looksLikeDocs = /^#{1,6}\s+\S/m.test(mdBody) || mdBody.split(/\s+/).length >= 40;
+    if (mdBody.length > 200 && looksLikeDocs && (mdCt.includes("text/markdown") || mdCt.includes("text/plain"))) {
+      // Wrap the markdown in a lightweight HTML shell so downstream helpers
+      // (title extraction, link extraction, scoreExtraction) still work. The
+      // wrapper carries the H1 as <title>; the markdown body sits in a <main>.
+      const mdTitle = mdBody.match(/^#\s+(.+)$/m)?.[1]?.trim() ?? "";
+      const wrapped = [
+        `<html><head>`,
+        `<title>${mdTitle || "GitBook Page"}</title>`,
+        `<meta name="x-gitbook-md-fallback" content="true"/>`,
+        `</head><body><main>`,
+        mdBody,
+        `</main></body></html>`,
+      ].join("");
+      return { md: mdBody, html: wrapped };
+    }
+  } catch {
+    /* .md fetch failed — caller falls through to its normal path */
+  }
+  return null;
+}
+
+/**
+ * TOW2-307: True when a text body reads as markdown-structured content — it has at
+ * least one ATX heading (`# Heading`), or is long enough to be document-like
+ * (>=40 words). Used to decide whether a `text/plain` response should be treated
+ * the same way as an explicit `text/markdown` response (title-from-heading +
+ * markdown-link parsing) versus returned as plain, unstructured text. Deliberately
+ * independent of attemptGitBookMdFallback's own `looksLikeDocs` check above (same
+ * shape, different call site — kept separate per scope: do not touch the GitBook
+ * fast-path).
+ *
+ * Exported (with deriveTitleFromMarkdown below) so site_copy.ts can apply the SAME
+ * text/markdown | text/plain passthrough gate to fetchSitePage — it had the identical
+ * Turndown-corruption bug (see site_copy.ts's fetchSitePage doc comment). site_copy.ts
+ * already imports detectJsHeavyContent from this module, so re-exporting these two is
+ * the established, cycle-free way to share extract.ts's leaf logic (extract.ts imports
+ * nothing from site_copy.ts).
+ */
+export function looksLikeMarkdown(body: string): boolean {
+  return /^#{1,6}\s+\S/m.test(body) || body.trim().split(/\s+/).filter(Boolean).length >= 40;
+}
+
+/**
+ * A body whose first non-whitespace char is `<` is HTML/XML, even when the server
+ * mislabels its content-type as `text/plain` (common on raw CDNs like
+ * raw.githubusercontent.com, S3, and misconfigured origins). Mirrors the guard the
+ * `application/json` branch already applies (`body.trimStart().startsWith("<")`) so
+ * mislabeled HTML falls through to real HTML extraction instead of being returned
+ * verbatim as "markdown" — which would both leak raw tags AND short-circuit
+ * site_copy's JS-render escalation. Scoped to `text/plain` only: a `text/markdown`
+ * response is explicitly declared and trusted (valid markdown may legitimately open
+ * with an inline `<div>`/`<!-- -->`). Review HIGH 2026-07-22, TOW2-307.
+ * Exported so site_copy.ts applies the identical guard on its passthrough gate.
+ */
+export function bodyLooksLikeHtml(body: string): boolean {
+  return body.trimStart().startsWith("<");
+}
+
+/** Derive a title from the body's first ATX H1 (`# Heading`). Null when none is found. */
+export function deriveTitleFromMarkdown(body: string): string | null {
+  const m = body.match(/^#\s+(.+)$/m);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Parse markdown links `[text](url)` (optionally with a trailing `"title"`) out of a
+ * raw markdown/text body, resolved against baseUrl. Malformed targets are skipped
+ * rather than throwing, so one bad link never drops the rest.
+ */
+function extractMarkdownLinks(body: string, baseUrl: string): string[] {
+  const links: string[] = [];
+  const re = /\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    try {
+      links.push(new URL(m[1], baseUrl).toString());
+    } catch { /* skip malformed link target */ }
+  }
+  return links;
+}
+
+/**
+ * TOW2-307: Format a `text/markdown` (or markdown-like `text/plain`) response
+ * WITHOUT ever running it through Turndown. extractMainContent/extractFullPageContent
+ * (utils/html.ts) call cheerio.load() + Turndown, which assumes HTML input — fed raw
+ * markdown, Turndown escapes every markdown-significant character (`*`, `_`, `[`, `]`,
+ * `` ` ``, etc.) via its text-node escaping pass AND collapses all whitespace
+ * (including newlines) in non-`<pre>` text nodes, destroying real structure. The body
+ * here IS the final output already; this only derives a title/links for the header
+ * and applies the same max_chars contract as the HTML path (truncatePreservingTable).
+ */
+function formatMarkdownExtract(
+  url: string,
+  mode: string,
+  body: string,
+  maxChars: number | undefined,
+  outputFormat: string | undefined,
+  isMarkdown: boolean,
+  contentType: string
+): string {
+  const limit = maxChars ?? MAX_CHARS_DEFAULT;
+  const title = (isMarkdown ? deriveTitleFromMarkdown(body) : null) ?? url;
+  const links = isMarkdown ? extractMarkdownLinks(body, url) : [];
+  const totalChars = body.length;
+  let content = body;
+  let isTruncated = false;
+  if (content.length > limit) {
+    content = truncatePreservingTable(content, limit);
+    isTruncated = true;
+  }
+  let origin = url;
+  try { origin = new URL(url).origin; } catch { /* ignore */ }
+  // Report the REAL Content-Type header the origin sent (charset stripped), not a
+  // label inferred from body shape — a markdown-shaped text/plain body must not be
+  // reported as "text/markdown" (TOW2-307 LOW). Fall back to the shape-based label
+  // only when the header was empty.
+  const contentTypeLabel = contentType.split(";")[0].trim() || (isMarkdown ? "text/markdown" : "text/plain");
+  // G-2: wrap only the fetched body text — every metadata field above/below (title,
+  // mode, chars, links, agent_instruction) stays OUR OWN text, unwrapped. Length/char
+  // metrics are computed from the unwrapped `content` so wrapper overhead never
+  // leaks into `chars:`/`total_chars`.
+  const wrappedContent = wrapUntrusted(content, url);
+
+  if (outputFormat === "json") {
+    return JSON.stringify({
+      url,
+      title,
+      mode,
+      source: "live",
+      content_type: contentTypeLabel,
+      content: wrappedContent,
+      content_truncated: isTruncated,
+      total_chars: totalChars,
+      links: { total: links.length, sample: links.slice(0, 15) },
+      agent_instruction: `This URL returned raw ${isMarkdown ? "markdown" : "plain text"}, not HTML — the content above is verbatim (no HTML-to-markdown conversion was applied, since the source was already text). To discover more pages call novada_map with url="${origin}".`,
+    }, null, 2);
+  }
+
+  const lines: string[] = [
+    `## Extracted Content`,
+    `url: ${url}`,
+    `mode: ${mode} | source: live | content_type: ${contentTypeLabel}`,
+    `title: ${title}`,
+    `chars:${content.length}${isTruncated ? ` (truncated, full: ${totalChars})` : ""} | links:${links.length}`,
+    ``,
+    `---`,
+    ``,
+    wrappedContent,
+  ];
+  if (isTruncated) {
+    const suggestedHigher = Math.min(limit * 2, 100000);
+    lines.push(``, `[Content truncated — showing first ${limit} of ${totalChars} total characters. Pass max_chars=${suggestedHigher} to get more.]`);
+  }
+  if (links.length > 0) {
+    lines.push(``, `---`, `## Links (${Math.min(links.length, 15)} of ${links.length})`);
+    for (const l of links.slice(0, 15)) lines.push(`- ${l}`);
+  }
+  lines.push(
+    ``,
+    `---`,
+    `## Agent Hints`,
+    `- This URL returned raw ${isMarkdown ? "markdown" : "plain text"} — the content above is verbatim. Turndown/HTML-to-markdown conversion was NOT applied, since the source is already text (running it through Turndown would escape markdown characters and collapse newlines).`,
+    `- To discover more pages: novada_map with url="${origin}"`,
+    ``,
+    `## Agent Action`,
+    `agent_instruction: status:success | raw ${isMarkdown ? "markdown" : "text"} passthrough`,
+  );
+  return lines.join("\n");
+}
+
+/** Core extraction logic — called via extractSingle which enforces the total request ceiling. */
+async function extractSingleInner(
+  params: ExtractParams & { url: string },
+  apiKey?: string
+): Promise<string> {
+  // Normalize render="js" → "render" (js is the agent-friendly alias)
+  if (params.render === "js") {
+    params = { ...params, render: "render" };
+  }
+
+  // Phase 3: Session dedup cache — skip fetch if same URL+mode+format+fields was extracted recently
+  const cacheRenderMode = params.render ?? "auto";
+  const cacheFormat = params.format ?? "markdown";
+  const cached = getCached(params.url, cacheRenderMode, cacheFormat, params.fields);
+  if (cached) {
+    // Inject source: cache into the cached result so agents know it's from cache
+    return cached.replace(/source: live/, "source: cache");
+  }
+
+  // Reddit rewrite: new reddit.com blocks all scrapers; old.reddit.com works with static fetch
+  const redditUrl = rewriteRedditUrl(params.url);
+  if (redditUrl) {
+    params = { ...params, url: redditUrl, render: "static" };
+  }
+
+  const renderMode = params.render ?? "auto";
+  const fetchedAt = new Date().toISOString();
+
+  let html: string;
+  let usedMode: "static" | "render" | "browser" | "render-failed" = "static";
+  let renderError: string | null = null;
+  // PARAM-HONESTY: true only when `params.country` was actually included in the
+  // fetch call whose result is the content currently held in `html`/`usedMode`.
+  // fetchWithRender is called from three sites below — two forward params.country,
+  // one (the low-quality-score escalation) does not — and Wayback/GitBook/browser
+  // fallbacks never honor country regardless of what preceded them. Set precisely
+  // at each site rather than inferred from usedMode alone, since usedMode can end
+  // up "render" via the country-less escalation path too.
+  //
+  // Review round 2: audited by enumerating EVERY write site of `usedMode` in this
+  // function (grep `usedMode = `) rather than spot-fixing the one reported bug —
+  // three sibling `pickBetterHtml({ html: renderHtml, mode: "render" }, ...)` calls
+  // exist and only one of them (the "render still JS-heavy → try browser" branch)
+  // had forgotten to propagate this flag when the render candidate wins. The other
+  // two pickBetterHtml call sites in this function never offer the country-fetched
+  // render candidate at all (they compare pre-render static html against browser
+  // html), so `best.mode` can never resolve to "render" there — nothing to set.
+  let countryAppliedToServedContent = false;
+  /** NOV-GB1: raw markdown from GitBook .md fallback, used to override mainContent extraction */
+  let gitbookMdContent: string | null = null;
+  /** Anti-bot provider detected during fetch (null = none detected) */
+  let detectedAntiBot: string | null = null;
+  /** Whether anti-bot was resolved via escalation */
+  let antiBotResolved = false;
+  // clean=true → main-content only; clean=false (default) → full page for maximum coverage.
+  // Hoisted above the escalation block so pickBetterHtml (#1/#12) can score candidates
+  // with the same extractor the formatter uses below.
+  const useFullPage = params.clean !== true;
+
+  // Domain registry: skip auto-detection probe for known sites
+  const domainHint = renderMode === "auto" ? lookupDomain(params.url) : null;
+  // NOV-330: session routing memory. Only consulted for "auto" when the hand-curated
+  // DOMAIN_REGISTRY has no entry (registry is authoritative and always wins). If a prior
+  // request this session already found the winning mode for this host, start there and
+  // skip the static→render→browser ladder. Advisory: the escalation/quality checks below
+  // still run, so a stale hint self-corrects (and recordRouteSuccess re-pins the new mode).
+  const routeHint = renderMode === "auto" && !domainHint ? getRouteHint(params.url) : null;
+  const effectiveMode = domainHint ? domainHint.method : (routeHint ?? renderMode);
+
+  // Pre-populate anti-bot provider from domain registry if known
+  if (domainHint?.provider) {
+    detectedAntiBot = domainHint.provider;
+  }
+
+  // Force modes (or registry-resolved modes) skip escalation logic
+  if (effectiveMode === "browser") {
+    // Bug1/Bug3 fix: pre-check runtime capability before attempting CDP connection.
+    // On serverless (Vercel/Lambda), connectOverCDP cannot hold the WS and fails with a raw
+    // "AuthorizationError" that looks like a credentials problem but is actually a transport
+    // limitation. Fail fast with a structured, actionable error instead.
+    // isBrowserAvailableOnRuntime() checks: isHostedEnvironment() (false on Vercel unless
+    // DEPLOYMENT_SUPPORTS_WS=true override) AND whether NOVADA_BROWSER_WS creds are set.
+    if (!isBrowserAvailableOnRuntime()) {
+      // NOV-GB2: BEFORE returning the browser-unavailable error, probe for a GitBook
+      // .md sibling. On the hosted endpoint browser is unavailable and this is the ONLY
+      // way GitBook docs content is reachable. A page can reach this branch via a
+      // route-memory / registry hint that pins "browser" for the host, so this probe
+      // must run here — not just in the auto/static ladder below.
+      //
+      // Cost guard (review HIGH #2): skip the probe when a known anti-bot provider is
+      // already identified (detectedAntiBot, set from domainHint.provider). Those domains
+      // genuinely require the CDP/browser tier and are never GitBook docs — probing them
+      // is a pure wasted fetch + proxy credit that ends in the same unavailable error.
+      // NOTE: we intentionally do NOT gate on a "gitbook" hostname substring — GitBook is
+      // frequently served on custom domains (e.g. developer.novada.com) with no such marker;
+      // the authoritative GitBook check is the CDN signature inside attemptGitBookMdFallback.
+      const probe = detectedAntiBot
+        ? ""
+        : await fetchWithRetry(params.url, { tool: "extract", headers: { "User-Agent": USER_AGENT }, timeout: 8000 })
+            .then(r => (typeof r.data === "string" ? r.data : ""))
+            .catch(() => "");
+      const gb = probe ? await attemptGitBookMdFallback(params.url, probe) : null;
+      if (gb) {
+        gitbookMdContent = gb.md;
+        html = gb.html;
+        usedMode = "static";
+      } else {
+        return getBrowserUnavailableError("browser");
+      }
+    } else {
+      html = await fetchViaBrowser(params.url, { waitForSelector: params.wait_for, wait_ms: params.wait_ms });
+      usedMode = "browser";
+    }
+  } else if (effectiveMode === "render") {
+    const response = await fetchWithRender(params.url, apiKey,
+      { tool: "extract", ...(domainHint?.proxyTier ? { proxyTier: domainHint.proxyTier } : {}), ...(params.country ? { country: params.country } : {}) }
+    );
+    const contentType = String((response.headers as Record<string, string>)?.["content-type"] ?? "");
+    if (isPdfResponse(params.url, contentType)) {
+      const pdfBuffer = Buffer.isBuffer(response.data)
+        ? response.data
+        : Buffer.from(response.data as string, "binary");
+      const pdf = await extractPdf(pdfBuffer);
+      html = `pdf_pages:${pdf.pages}\n${pdf.title ? `title: ${pdf.title}\n` : ""}${pdf.text}`;
+    } else if (contentType.includes("application/json")) {
+      const body = typeof response.data === "string"
+        ? response.data
+        : JSON.stringify(response.data, null, 2);
+      if (body.trimStart().startsWith("<")) {
+        html = body;
+      } else {
+        return formatJsonExtract(params.url, "render", body, params.max_chars, params.format);
+      }
+    } else if (typeof response.data === "string" && (contentType.includes("text/markdown") || (contentType.includes("text/plain") && !bodyLooksLikeHtml(response.data)))) {
+      // TOW2-307: text/markdown or text/plain bodies are ALREADY the final content —
+      // never run them through Turndown (see formatMarkdownExtract's doc comment).
+      // This gate must run AHEAD of the generic HTML default below, which otherwise
+      // treats every non-JSON/non-PDF body as HTML and Turndown-converts it.
+      // text/plain that is actually HTML (mislabeled by raw CDNs) is excluded by
+      // bodyLooksLikeHtml so it falls through to real HTML extraction (review HIGH).
+      const body = response.data;
+      const isMarkdownCT = contentType.includes("text/markdown");
+      return formatMarkdownExtract(params.url, "render", body, params.max_chars, params.format, isMarkdownCT || looksLikeMarkdown(body), contentType);
+    } else {
+      if (typeof response.data !== "string") {
+        throw makeNovadaError(
+          NovadaErrorCode.INVALID_PARAMS,
+          "Response is not HTML. The URL may return JSON or binary data.",
+          `url:${params.url} returned non-string content-type`
+        );
+      }
+      html = response.data;
+    }
+    // NOV-GB2: render mode returned a GitBook shell — prefer the .md sibling. GitBook
+    // content lives in client bundles, so even a rendered fetch is often just chrome.
+    // The .md endpoint is authoritative and cheaper than a browser escalation.
+    if (typeof html === "string") {
+      const gb = await attemptGitBookMdFallback(params.url, html);
+      if (gb) {
+        gitbookMdContent = gb.md;
+        html = gb.html;
+        usedMode = "static";
+      }
+    }
+    // F2 / QW-4: Detect bot-challenge pages returned by the Web Unblocker (any size).
+    // A full-size Cloudflare interstitial (e.g., "Attention Required! | Cloudflare", "Sorry,
+    // you have been blocked") is several KB — the old html.length < 2000 guard missed it.
+    // Fix: run detectBotChallenge unconditionally; attempt browser escalation when available,
+    // otherwise surface a concrete error instead of silently returning interstitial text.
+    // NOV-GB2: if the .md fallback already resolved content, skip the bot-challenge
+    // escalation entirely — the synthetic wrapper is not a challenge page and must
+    // keep its "static" usedMode (set by attemptGitBookMdFallback above).
+    if (gitbookMdContent === null && typeof html === "string" && detectBotChallenge(html)) {
+      if (isBrowserConfigured()) {
+        const browserHtml = await fetchViaBrowser(params.url, { waitForSelector: params.wait_for, wait_ms: params.wait_ms }).catch(() => null);
+        // F2/R3: Use pickBetterHtml (quality-score comparison) instead of raw byte
+        // length to decide whether to accept the browser result. Raw length is
+        // unreliable because a padded Cloudflare interstitial (several KB) can be
+        // longer than a short-but-real page, causing good content to be discarded.
+        const best = pickBetterHtml(
+          { html, mode: "render" },
+          { html: browserHtml ?? "", mode: "browser" },
+          params.url,
+          useFullPage
+        );
+        if (best.adopted) {
+          html = best.html;
+          usedMode = "browser";
+        } else {
+          // Browser also returned challenge / nothing better — surface as error
+          throw makeNovadaError(
+            NovadaErrorCode.URL_UNREACHABLE,
+            "Render returned a bot challenge page",
+            `url:${params.url} render=render returned a bot challenge page; browser escalation also failed`
+          );
+        }
+      } else {
+        // No browser configured — throw so the caller surfaces an honest error
+        throw makeNovadaError(
+          NovadaErrorCode.URL_UNREACHABLE,
+          "Render returned a bot challenge page",
+          `url:${params.url} render=render returned a bot challenge page (Cloudflare/anti-bot interstitial). ` +
+          `Use render=browser with NOVADA_BROWSER_WS configured, or try a different URL.`
+        );
+      }
+    } else if (gitbookMdContent === null) {
+      usedMode = "render";
+      // This branch's fetchWithRender call above forwarded params.country.
+      countryAppliedToServedContent = Boolean(params.country);
+    }
+  } else {
+    // Auto or static:
+    // P1-2: Race a direct HTTP fetch (no proxy) against the proxy for "auto" mode.
+    // Open static sites (HN, TechCrunch, Wikipedia) respond in ~300ms direct vs ~3s via proxy.
+    // Direct "wins" only if it returns clean HTML (no bot challenge, no JS-heavy indicators).
+    // Bot-protected or JS-heavy: direct rejects, proxy result is used — no change in behavior.
+    const domainProxyTier = domainHint?.proxyTier;
+    const response = await (effectiveMode === "auto"
+      ? Promise.any([
+          fetchWithRetry(params.url, { tool: "extract", headers: { "User-Agent": USER_AGENT }, timeout: 3000 })
+            .then(r => {
+              const body = typeof r.data === "string" ? r.data : null;
+              if (body && !detectBotChallenge(body) && !detectJsHeavyContent(body)) return r;
+              // FIX-A polish: a descriptive rejection reason (not a bare sentinel like
+              // "not-static") so that if this leg ends up inside an AggregateError's
+              // cause list (summarizeAggregateError), the surfaced cause is actionable
+              // rather than an internal implementation detail.
+              throw new Error("direct fetch returned bot-challenge/JS-heavy content, deferring to proxy");
+            }),
+          fetchViaProxy(params.url, apiKey, { tool: "extract", ...(domainProxyTier ? { proxyTier: domainProxyTier } : {}) }),
+        ]).catch(err => {
+          // FIX-A (2026-07-30): a bare Promise.any AggregateError leaks the literal
+          // "All promises were rejected" — zero actionable content (live report:
+          // extracting cell.com surfaced this raw string, agent guessed "可能是限流").
+          // Map it to a NovadaError carrying the DISTINCT underlying causes so the
+          // top-level catch + getSuggestedFix below can build a real agent_instruction.
+          // Non-aggregate rejections (e.g. a single fetch throwing directly) pass
+          // through completely unchanged — never mask the original error.
+          const agg = summarizeAggregateError(err);
+          if (!agg) throw err;
+          throw makeNovadaError(
+            NovadaErrorCode.URL_UNREACHABLE,
+            agg.message,
+            `url:${params.url} direct-fetch and proxy-fetch both rejected`
+          );
+        })
+      : fetchViaProxy(params.url, apiKey, { tool: "extract", ...(domainProxyTier ? { proxyTier: domainProxyTier } : {}) }));
+    const contentType = String((response.headers as Record<string, string>)?.["content-type"] ?? "");
+    if (isPdfResponse(params.url, contentType)) {
+      const pdfBuffer = Buffer.isBuffer(response.data)
+        ? response.data
+        : Buffer.from(response.data as string, "binary");
+      const pdf = await extractPdf(pdfBuffer);
+      html = `pdf_pages:${pdf.pages}\n${pdf.title ? `title: ${pdf.title}\n` : ""}${pdf.text}`;
+    } else if (contentType.includes("application/json")) {
+      const body = typeof response.data === "string"
+        ? response.data
+        : JSON.stringify(response.data, null, 2);
+      if (body.trimStart().startsWith("<")) {
+        html = body;
+      } else {
+        return formatJsonExtract(params.url, "static", body, params.max_chars, params.format);
+      }
+    } else if (typeof response.data === "string" && (contentType.includes("text/markdown") || (contentType.includes("text/plain") && !bodyLooksLikeHtml(response.data)))) {
+      // TOW2-307: text/markdown or text/plain bodies are ALREADY the final content —
+      // never run them through Turndown (see formatMarkdownExtract's doc comment).
+      // This gate must run AHEAD of the generic HTML default below, which otherwise
+      // treats every non-JSON/non-PDF body as HTML and Turndown-converts it.
+      // text/plain that is actually HTML (mislabeled by raw CDNs) is excluded by
+      // bodyLooksLikeHtml so it falls through to real HTML extraction (review HIGH).
+      const body = response.data;
+      const isMarkdownCT = contentType.includes("text/markdown");
+      return formatMarkdownExtract(params.url, "static", body, params.max_chars, params.format, isMarkdownCT || looksLikeMarkdown(body), contentType);
+    } else {
+      if (typeof response.data !== "string") {
+        throw makeNovadaError(
+          NovadaErrorCode.INVALID_PARAMS,
+          "Response is not HTML. The URL may return JSON or binary data.",
+          `url:${params.url} returned non-string content-type`
+        );
+      }
+      html = response.data;
+    }
+
+    // GitBook .md fallback (NOV-GB1 / NOV-GB2):
+    // If the static HTML is served by GitBook (CDN signature), fetch the authoritative
+    // <url>.md sibling BEFORE any render/browser escalation. This is a free, no-JS path
+    // that works on the hosted (Vercel) endpoint where render 503s and browser is
+    // unavailable. See attemptGitBookMdFallback for the full detection contract.
+    // NOV-GB2 fix: gate on the GitBook CDN signature ALONE — NOT detectJsHeavyContent,
+    // which returns false on modern GitBook's ~500KB shell (no __next/id=root markers).
+    {
+      const gb = await attemptGitBookMdFallback(params.url, html);
+      if (gb) {
+        gitbookMdContent = gb.md;
+        html = gb.html;
+        usedMode = "static";
+      }
+    }
+
+    // Skip JS detection if we already have PDF content (no escalation needed).
+    // Also skip if domainHint resolved this domain — DOMAIN_REGISTRY classification is
+    // authoritative for known domains and overrides JS-heavy detection heuristics.
+    // NOV-GB1: also skip when the GitBook .md fallback already resolved the content —
+    // the synthetic HTML wrapper we built is NOT JS-heavy; avoid a false re-escalation.
+    if (renderMode === "auto" && !domainHint && !html.startsWith("pdf_pages:") && !gitbookMdContent && (detectJsHeavyContent(html) || detectBotChallenge(html))) {
+      // Identify anti-bot provider from the static HTML before escalation
+      detectedAntiBot = identifyAntiBot(html);
+
+      // Escalate to render mode (JS-heavy OR bot challenge on static fetch)
+      try {
+        const renderResponse = await fetchWithRender(params.url, apiKey, { tool: "extract", ...(params.country ? { country: params.country } : {}) });
+        const renderHtml = String(renderResponse.data);
+        if (detectBotChallenge(renderHtml)) {
+          // Re-check anti-bot on render result (may differ from static)
+          detectedAntiBot = detectedAntiBot ?? identifyAntiBot(renderHtml);
+          // Render returned a bot challenge page — escalate to browser if available
+          if (isBrowserConfigured()) {
+            // #1/#12: browser can throw or return an empty challenge stub. Keep the
+            // static html (still in `html`) when the browser result isn't better.
+            const browserHtml = await fetchViaBrowser(params.url, { waitForSelector: params.wait_for, wait_ms: params.wait_ms }).catch(() => "");
+            const best = pickBetterHtml({ html, mode: usedMode }, { html: browserHtml, mode: "browser" }, params.url, useFullPage);
+            html = best.html;
+            usedMode = best.mode;
+            antiBotResolved = best.adopted;
+            if (!best.adopted) {
+              usedMode = "render-failed";
+              renderError = "Render returned a bot challenge page; browser fallback returned no better content";
+            }
+          } else {
+            // No browser available — keep static html, mark as failed
+            usedMode = "render-failed";
+            renderError = "Render returned a bot challenge page";
+          }
+        } else if (!detectJsHeavyContent(renderHtml)) {
+          html = renderHtml;
+          usedMode = "render";
+          antiBotResolved = detectedAntiBot !== null;
+          // The fetchWithRender call above (line ~1154) forwarded params.country.
+          countryAppliedToServedContent = Boolean(params.country);
+        } else if (isBrowserConfigured()) {
+          // render also JS-heavy — try full browser
+          // #1/#12: keep the best of {static html, render html, browser html}.
+          const browserHtml = await fetchViaBrowser(params.url, { waitForSelector: params.wait_for, wait_ms: params.wait_ms }).catch(() => "");
+          // Compare browser against render (render is JS-heavy but still better than static here).
+          const best = pickBetterHtml({ html: renderHtml, mode: "render" }, { html: browserHtml, mode: "browser" }, params.url, useFullPage);
+          html = best.html;
+          usedMode = best.mode;
+          antiBotResolved = best.adopted;
+          // Review round 2 (HIGH): unlike its two siblings above/below, this branch
+          // offers the country-fetched renderHtml itself as a pickBetterHtml candidate
+          // (mode:"render") — so when the browser candidate does NOT win (best.adopted
+          // false, best.mode stays "render"), the SERVED content is that render fetch,
+          // which forwarded params.country at line ~1154. Must be set here too, not
+          // just in the two branches that skip pickBetterHtml entirely.
+          if (usedMode === "render") {
+            countryAppliedToServedContent = Boolean(params.country);
+          }
+        } else {
+          // render worked but still JS-heavy, use it (better than static)
+          html = renderHtml;
+          usedMode = "render";
+          // Same fetchWithRender call as above — params.country was forwarded.
+          countryAppliedToServedContent = Boolean(params.country);
+        }
+      } catch (err) {
+        // Early exit for SSL/TLS certificate errors — escalation won't fix server-side cert issues
+        const certMsg = err instanceof Error ? err.message : String(err);
+        const isCertError = certMsg?.includes('CERT_') || certMsg?.includes('SSL') || certMsg?.includes('certificate');
+        if (isCertError) {
+          throw new Error(`SSL certificate error for ${params.url}. The site has an invalid/expired certificate. agent_instruction: This is a server-side issue, not fixable by changing render mode.`);
+        }
+        // render threw — try Browser API if available
+        renderError = err instanceof Error ? err.message : String(err);
+        if (isBrowserConfigured()) {
+          // #1/#12: browser can also fail/return empty. Keep the static html (in `html`)
+          // when the browser result isn't better, instead of returning near-empty.
+          const browserHtml = await fetchViaBrowser(params.url, { waitForSelector: params.wait_for, wait_ms: params.wait_ms }).catch(() => "");
+          const best = pickBetterHtml({ html, mode: usedMode }, { html: browserHtml, mode: "browser" }, params.url, useFullPage);
+          html = best.html;
+          usedMode = best.adopted ? best.mode : "render-failed";
+          antiBotResolved = best.adopted;
+        } else {
+          usedMode = "render-failed";
+        }
+      }
+    }
+  }
+
+  // NOV-330: remember the winning mode for this host so the rest of the session can
+  // start there. recordRouteSuccess ignores the "render-failed" pseudo-mode, so only a
+  // genuine static/render/browser success is pinned. Cheap + best-effort.
+  // NOV-GB2: do NOT pin a route when the GitBook .md fallback resolved — usedMode is set
+  // to "static" as a synthetic label, but the host did NOT actually serve usable content
+  // via a plain static fetch (it needed the .md special-path). Pinning "static" here would
+  // misclassify the host for subsequent pages. The GitBook .md probe runs on all branches
+  // anyway, so skipping the pin loses nothing.
+  if (gitbookMdContent === null) {
+    recordRouteSuccess(params.url, usedMode);
+  }
+  // NOV-334: request logging now happens centrally in the fetch helpers (fetchViaProxy /
+  // fetchWithRender / fetchWithRetry), so every tool — not just extract — emits one
+  // structured stderr line per upstream request (silent unless NOVADA_LOG=debug). The
+  // per-extract summary line was removed here to avoid double-logging.
+
+  // Detect PDF output from router (prefixed with pdf_pages:N)
+  const pdfPageMatch = html.match(/^pdf_pages:(\d+)\n/);
+  let pdfPages: number | null = null;
+  let pdfTitle: string | undefined;
+  if (pdfPageMatch) {
+    pdfPages = parseInt(pdfPageMatch[1], 10);
+    // Extract optional title line before stripping prefix
+    const titleLine = html.match(/^pdf_pages:\d+\ntitle: ([^\n]+)\n/);
+    pdfTitle = titleLine?.[1];
+    // Strip the pdf_pages prefix (and optional title line)
+    html = html.replace(/^pdf_pages:\d+\n(?:title: [^\n]+\n)?/, "");
+  }
+
+  // NOV-577: parse the finalized HTML ONCE and share that read-only document across the
+  // title/description/links/structured-data readers below, instead of each helper calling
+  // cheerio.load(html) again (was 4 redundant parses per request). The content extractors
+  // (extractMainContent/extractFullPageContent) mutate their DOM, so they still load their own.
+  // PDFs have no HTML to parse — $doc stays null and the PDF branches supply values directly.
+  let $doc: CheerioAPI | null = pdfPages !== null ? null : cheerio.load(html);
+
+  let title = pdfPages !== null ? (pdfTitle ?? params.url) : extractTitleFrom($doc!);
+  let description = $doc ? extractDescriptionFrom($doc) : "";
+  let stillJsHeavy = renderMode === "auto" && (usedMode === "static" || usedMode === "render-failed") && detectJsHeavyContent(html);
+
+  // NOV-668: Kufer/webbasys availability detection — runs on the raw cheerio DOM
+  // BEFORE markdown conversion strips inline styles and text nodes.
+  const kuferResult = $doc ? detectKuferAvailability($doc, params.url) : null;
+
+  if (params.format === "html") {
+    // Honor max_chars for html format; default 100K for full-page DOM pipelines.
+    // (Was hardcoded 10K — too small for full-page DOM pipelines that need the full source.)
+    const htmlMaxChars = params.max_chars ?? 100000;
+    let htmlOutput: string;
+    if (html.length <= htmlMaxChars) {
+      htmlOutput = html;
+    } else {
+      const truncated = html.slice(0, htmlMaxChars);
+      const lastTagClose = truncated.lastIndexOf(">");
+      htmlOutput = (lastTagClose > htmlMaxChars - 1000 ? truncated.slice(0, lastTagClose + 1) : truncated) +
+        `\n<!-- Content truncated at ${htmlMaxChars} characters — pass max_chars to increase (max: 100000) -->`;
+    }
+    // Save full (untruncated) HTML to file — best-effort, never breaks the tool
+    try {
+      const domain = new URL(params.url).hostname.replace("www.", "");
+      const outputResult = await saveOutput({
+        tool: "extract",
+        hint: domain,
+        format: "html",
+        data: html,
+        project: params.project,
+      });
+      // FIX-1: Redact absolute path.
+      htmlOutput += `\n<!-- Output saved: ${redactSecrets(outputResult.filePath)} -->`;
+    } catch { /* best-effort */ }
+    return htmlOutput;
+  }
+
+  // For PDF content, use the text directly (no HTML parsing needed).
+  // NOV-GB1: when the GitBook .md fallback fired, use the raw markdown directly —
+  // the standard HTML extractors would strip most content from the synthetic wrapper.
+  // useFullPage is hoisted to the fetch section above (shared with pickBetterHtml).
+  // F17: no pre-slice for PDFs and no internal extractMainContent cap here — the
+  // flagged display truncation below is the single truncation authority, so
+  // content_truncated:true + total_chars are emitted whenever content is cut
+  // (the old html.slice(0, MAX_CHARS_DEFAULT) / internal-25000-cap paths truncated
+  // SILENTLY below the flag check — eval F17).
+  // F15: extractContentSafe converts a readability/Turndown crash into a classified
+  // PARSE_FAILED error (honest "Content parse failed" + parser-bypass suggested_fix)
+  // instead of a raw TypeError bubbling to the agent.
+  let mainContent = gitbookMdContent !== null
+    ? gitbookMdContent
+    : pdfPages !== null
+      ? html
+      : extractContentSafe(html, params.url, useFullPage);
+
+  let allLinks = $doc ? extractLinksFrom($doc, params.url) : [];
+  let baseDomain: string;
+  try {
+    baseDomain = new URL(params.url).hostname.replace(/^www\./, "");
+  } catch {
+    baseDomain = "";
+  }
+  let sameDomainLinks = allLinks
+    .filter(link => {
+      try {
+        return new URL(link).hostname.replace(/^www\./, "") === baseDomain;
+      } catch { return false; }
+    })
+    .slice(0, 15);
+
+  // P0-5: max_chars truncation — applies to ALL formats (text, markdown, html handled separately)
+  const maxChars = params.max_chars ?? MAX_CHARS_DEFAULT;
+
+  if (params.format === "text") {
+    let plainContent = mainContent
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/^\- /gm, "  * ")
+      .replace(/\*\*([^*]+)\*\*/g, "$1");
+    const totalCharsText = plainContent.length;
+    if (plainContent.length > maxChars) {
+      const suggestedHigher = Math.min(maxChars * 2, 100000);
+      plainContent = plainContent.slice(0, maxChars) +
+        `\n\n[Content may be truncated — showing first ${maxChars} of ${totalCharsText} total characters. Pass max_chars=${suggestedHigher} to get more.]`;
+    }
+    const linksText = sameDomainLinks.length > 0
+      ? `\nSame-domain links:\n${sameDomainLinks.map(l => `  ${l}`).join("\n")}`
+      : "";
+    return `${title}\n${description ? description + "\n" : ""}\n${plainContent}${linksText}`;
+  }
+
+  // Quality scoring (skip structured data extraction for PDFs — no HTML schema)
+  let structuredData = $doc ? extractStructuredDataFrom($doc) : null;
+  let hasStructuredData = structuredData !== null;
+  let quality = scoreExtraction(html, mainContent, usedMode, hasStructuredData);
+
+  // P0-1: Quality floor — never return quality:0 for non-empty content.
+  // Only the display `score` is floored; `cleanliness_score` stays the raw markup value.
+  if (mainContent && mainContent.length > 0 && quality.score === 0) {
+    quality.score = 1;
+  }
+
+  // BUG-E1: Auto-escalation — retry with render when static quality is too low
+  let autoEscalated = false;
+  let autoEscalatedTo: "render" | "browser" | null = null;
+  // INC-199: Track failed escalation attempts so we can surface them instead of silent failure
+  let escalationAttempted = false;
+  let escalationFailed = false;
+  let escalationError: string | null = null;
+  // INC-202: Skip quality-score escalation when domain was resolved via DOMAIN_REGISTRY.
+  // Registry entries are pre-classified — a low quality score on a "static" known domain
+  // means the page is genuinely small (e.g. example.com), not that it needs JS rendering.
+  // Without this guard, minimal static pages trigger fetchWithRender, adding 3–10s of latency.
+  // NOV-565: also require !content_present — a page that already has substantive text
+  // must not re-fetch via render/browser just because its cleanliness score is low.
+  if (renderMode === "auto" && usedMode === "static" && quality.score < 40 && !quality.content_present && !html.startsWith("pdf_pages:") && !domainHint) {
+    escalationAttempted = true;
+    try {
+      // PARAM-HONESTY: this call deliberately does NOT forward params.country (pre-existing
+      // behavior, unchanged here) — so even if it sets usedMode="render" below,
+      // countryAppliedToServedContent must stay false; do not add country here as a side
+      // effect of this fix.
+      const renderResponse = await fetchWithRender(params.url, apiKey, { tool: "extract" });
+      if (typeof renderResponse.data !== "string") {
+        // F14: render responded but with a non-HTML body — the page could NOT be
+        // verified via render. Record it so the honest-failure framing below fires
+        // instead of the short-but-complete rescue green-lighting the static shell.
+        escalationError = "render escalation returned a non-HTML response";
+      } else if (detectBotChallenge(renderResponse.data)) {
+        // F14: render responded with a bot-challenge interstitial — same as above:
+        // the real page was NOT verified; do not let the static shell read as success.
+        escalationError = "render escalation returned a bot-challenge page";
+      } else {
+        const renderHtml = renderResponse.data;
+        // NOV-577: one parse of the re-fetched HTML, shared across the readers in this branch.
+        const $render = cheerio.load(renderHtml);
+        // F15: extractContentSafe throws a CLASSIFIED parse error on a parser crash —
+        // caught by this branch's catch below (escalationError), never a raw TypeError.
+        const renderMain = extractContentSafe(renderHtml, params.url, useFullPage);
+        const renderSD = extractStructuredDataFrom($render);
+        const renderQuality = scoreExtraction(renderHtml, renderMain, "render", renderSD !== null);
+        if (renderQuality.score > quality.score) {
+          html = renderHtml;
+          $doc = $render;
+          usedMode = "render";
+          mainContent = renderMain;
+          allLinks = extractLinksFrom($render, params.url);
+          sameDomainLinks = allLinks
+            .filter(link => {
+              try { return new URL(link).hostname.replace(/^www\./, "") === baseDomain; }
+              catch { return false; }
+            })
+            .slice(0, 15);
+          structuredData = renderSD;
+          hasStructuredData = renderSD !== null;
+          quality = renderQuality;
+          if (quality.score === 0 && mainContent.length > 0) quality.score = 1;
+          title = extractTitleFrom($render);
+          description = extractDescriptionFrom($render);
+          stillJsHeavy = false;
+          autoEscalated = true;
+          autoEscalatedTo = "render";
+          detectedAntiBot = detectedAntiBot ?? identifyAntiBot(html);
+          antiBotResolved = detectedAntiBot !== null;
+        }
+      }
+    } catch (e) {
+      // INC-199: Track render escalation failure
+      escalationError = e instanceof Error ? e.message : String(e);
+    }
+
+    // If render escalation didn't improve quality enough, try browser as final fallback
+    // NOV-565: skip browser fallback when content is already present (full-text page).
+    if (quality.score < 40 && !quality.content_present && isBrowserConfigured()) {
+      try {
+        const browserHtml = await fetchViaBrowser(params.url, { waitForSelector: params.wait_for, wait_ms: params.wait_ms });
+        // NOV-577: one parse of the browser HTML, shared across the readers in this branch.
+        const $browser = cheerio.load(browserHtml);
+        // F15: classified throw on parser crash — caught by this branch's own catch
+        // (keep previous result), never a raw TypeError.
+        const browserMain = extractContentSafe(browserHtml, params.url, useFullPage);
+        const browserSD = extractStructuredDataFrom($browser);
+        const browserQuality = scoreExtraction(browserHtml, browserMain, "browser", browserSD !== null);
+        if (browserQuality.score > quality.score) {
+          html = browserHtml;
+          $doc = $browser;
+          usedMode = "browser";
+          mainContent = browserMain;
+          allLinks = extractLinksFrom($browser, params.url);
+          sameDomainLinks = allLinks
+            .filter(link => {
+              try { return new URL(link).hostname.replace(/^www\./, "") === baseDomain; }
+              catch { return false; }
+            })
+            .slice(0, 15);
+          structuredData = browserSD;
+          hasStructuredData = browserSD !== null;
+          quality = browserQuality;
+          if (quality.score === 0 && mainContent.length > 0) quality.score = 1;
+          title = extractTitleFrom($browser);
+          description = extractDescriptionFrom($browser);
+          stillJsHeavy = false;
+          autoEscalated = true;
+          autoEscalatedTo = "browser";
+          detectedAntiBot = detectedAntiBot ?? identifyAntiBot(browserHtml);
+          antiBotResolved = true;
+        }
+      } catch { /* keep previous result */ }
+    }
+
+    // INC-199: If quality is still low after all escalation attempts, mark as failed
+    // NOV-565: don't flag escalation_failed when the page actually has content.
+    if (quality.score < 40 && !quality.content_present && !autoEscalated) {
+      escalationFailed = true;
+    }
+  }
+
+  // P2-1: Wayback Machine auto-fallback — when content is very poor, try archive.org
+  let waybackFallback = false;
+  if (mainContent.length < 100 && quality.score < 20 && !html.startsWith("pdf_pages:")) {
+    try {
+      const archiveUrl = `https://web.archive.org/web/2024/${params.url}`;
+      const wbResponse = await fetchViaProxy(archiveUrl, apiKey, { tool: "extract" });
+      if (typeof wbResponse.data === "string" && wbResponse.data.length > 500) {
+        const wbHtml = wbResponse.data;
+        // F15: classified throw on parser crash — caught by the Wayback try/catch
+        // (keep original result), never a raw TypeError.
+        const wbMain = extractContentSafe(wbHtml, params.url, useFullPage);
+        if (wbMain.length > mainContent.length) {
+          // NOV-577: one parse of the Wayback HTML, shared across the readers in this branch.
+          const $wb = cheerio.load(wbHtml);
+          html = wbHtml;
+          $doc = $wb;
+          mainContent = wbMain;
+          title = extractTitleFrom($wb);
+          description = extractDescriptionFrom($wb);
+          allLinks = extractLinksFrom($wb, params.url);
+          sameDomainLinks = allLinks
+            .filter(link => {
+              try { return new URL(link).hostname.replace(/^www\./, "") === baseDomain; }
+              catch { return false; }
+            })
+            .slice(0, 15);
+          structuredData = extractStructuredDataFrom($wb);
+          hasStructuredData = structuredData !== null;
+          quality = scoreExtraction(wbHtml, wbMain, usedMode, hasStructuredData);
+          if (quality.score === 0 && wbMain.length > 0) quality.score = 1;
+          waybackFallback = true;
+          // PARAM-HONESTY: archive.org is fetched via fetchViaProxy with no country
+          // option — served content no longer reflects any earlier country-aware
+          // render, regardless of what usedMode still says.
+          countryAppliedToServedContent = false;
+        }
+      }
+    } catch { /* Wayback unavailable — keep original result */ }
+  }
+
+  // PARAM-HONESTY: country is accepted but silently dropped on the default auto/static
+  // path (fetchViaProxy has no country field — utils/http.ts) — types.ts:186 already
+  // says so in the schema description, but that fine print never reaches a runtime
+  // response. Fires only when the caller actually supplied country AND it genuinely
+  // was not applied to the content that ended up being served (usedMode/countryAppliedToServedContent
+  // are set precisely at each fetch call site above, not inferred/guessed here).
+  const countryNotApplied = Boolean(params.country) && !countryAppliedToServedContent;
+
+  // max_chars truncation for markdown format
+  // NOV-671: use table-preserving truncation — when a table sits in the last ~30%
+  // of content and would be cut, we trim boilerplate above and keep the table intact.
+  const totalChars = mainContent.length;
+  // Item 4 (TOW2-241): when clean=true the main-content extraction removes nav/footer,
+  // but docs-site chrome ("Copy page", "YesNo", "⌘I", anchor-link marks) still leaks
+  // through as inline text. Apply stripBoilerplate on the clean path before truncation
+  // so the chrome never appears in the agent-facing output.
+  // Root cause: OUR CODE — the clean path did not call stripBoilerplate on output.
+  let displayContent = params.clean === true ? stripBoilerplate(mainContent) : mainContent;
+  let contentTruncated = false;
+  // G-2: kept OUT of displayContent (which gets wrapUntrusted-wrapped below) — this
+  // is OUR OWN notice, not fetched text, and must render outside the untrusted block.
+  let truncationNotice: string | null = null;
+  if (displayContent.length > maxChars) {
+    displayContent = truncatePreservingTable(displayContent, maxChars);
+    const suggestedHigher = Math.min(maxChars * 2, 100000);
+    truncationNotice = `[Content may be truncated — showing first ${maxChars} of ${totalChars} total characters. Pass max_chars=${suggestedHigher} to get more.]`;
+    contentTruncated = true;
+  }
+  // G-2: the fetched page body — wrap ONCE here so both the JSON `content` field and
+  // the markdown body (below) carry the same untrusted-source marking. Everything else
+  // in this function's output (headers, quality, fields, hints, agent_instruction) is
+  // OUR OWN text and stays unwrapped.
+  const wrappedDisplayContent = wrapUntrusted(displayContent, params.url);
+  // G-2: the exact string the JSON branch's `content` field holds — wrapper +
+  // (when present) our own truncation notice appended AFTER the wrap so the
+  // notice itself is never inside the untrusted block.
+  const jsonContentField = wrappedDisplayContent + (truncationNotice ? `\n\n${truncationNotice}` : "");
+
+  const contentLen = totalChars;
+  const isTruncated = contentTruncated;
+
+  // Field extraction
+  // Use the FULL pre-truncation content (mainContent), not the display-capped slice.
+  // displayContent is sliced to max_chars (default 25k) purely for inline rendering;
+  // a field located past that cap on a long page must still resolve, so the markdown-text
+  // layers (pattern/generic/tolerant/proximity/heading in fields.ts) get the uncapped text.
+  let fieldResults: FieldResult[] | null = null;
+  if (params.fields && params.fields.length > 0) {
+    // NOV-577: reuse $doc (the single parse of the finalized html) so the field DOM layers
+    // don't re-parse — $doc tracks every escalation re-fetch (render/browser/wayback) above.
+    fieldResults = extractFields(params.fields, structuredData, mainContent, html, $doc);
+  }
+
+  const metaExtra = contentTruncated
+    ? ` | content_truncated:true | total_chars:${totalChars}`
+    : "";
+
+  // R4: Quality signal, not quality verdict. A page that returned clean, real prose
+  // is PRESENT even when it is short (example.com: 20 words, complete + correct).
+  // `quality.content_present` (utils/html.ts) uses a 200char/50word "substantive"
+  // threshold — good for ranking, wrong as a presence verdict: a short-but-complete
+  // page fails it and used to render `content_present:false` next to the very text it
+  // denies. Here we compute a display-level presence judgment that rescues the
+  // short-but-complete case WITHOUT overclaiming on empty / bot-challenge / JS-empty
+  // pages. Used only for FRAMING (header line, hints, agent_instruction) — the raw
+  // numeric score is still reported for callers that want it.
+  const fetchSucceeded = usedMode !== "render-failed" && !stillJsHeavy;
+  const wordCount = mainContent.trim() ? mainContent.trim().split(/\s+/).length : 0;
+  // A page whose returned HTML is a bot-challenge / anti-bot interstitial is NOT
+  // "complete but short" — it is an absence dressed as content. Exclude it so the
+  // rescue below never green-lights "Checking your browser…" style stubs.
+  const isChallengePage = detectedAntiBot !== null || (typeof html === "string" && detectBotChallenge(html));
+  // F14 (2026-09-10 audit): the render escalation's FETCH itself failed or returned an
+  // unverifiable body (thrown 401/5xx, bot-challenge interstitial, non-HTML). Distinct
+  // from "render succeeded but added nothing" (escalationError stays null there): when
+  // the fetch failed we could NOT verify the page via render, so the static shell must
+  // never be rescued into a success — that is exactly the quotes.toscrape.com/js/ lie
+  // (empty JS shell graded content_ok:true while the 401 sat buried in a hints line).
+  const escalationFetchFailed = escalationFailed && escalationError !== null;
+  // Short-but-complete: real prose returned on a successful, non-challenge fetch,
+  // just under the "substantive" bar. Word floor (12) + length floor (80) keep
+  // genuinely thin/challenge stubs (e.g. a 7-word "checking your browser" page) OUT,
+  // while a complete brief page like example.com (~29 words) is correctly rescued.
+  // F14: a shell whose escalation fetch FAILED is an absence dressed as chrome — the
+  // rescue is blocked; a shell whose escalation succeeded-but-added-nothing has been
+  // VERIFIED via render as genuinely short and may still be rescued (R4 preserved).
+  const isShortButComplete =
+    fetchSucceeded &&
+    !isChallengePage &&
+    !escalationFetchFailed &&
+    !quality.content_present &&
+    wordCount >= 12 &&
+    mainContent.trim().length >= 80;
+  // Display-level presence: true whenever there is usable content in THIS payload.
+  const contentPresentDisplay = quality.content_present || isShortButComplete;
+
+  // NOV-565: content_ok is driven by content presence (substantive prose detected on the
+  // CLEANED markdown), not the cleanliness score. Docs pages with full text but link-heavy
+  // markup used to fail the old `score >= 40` gate; now a page with real content passes.
+  // R4: a short-but-complete page (example.com) is also content_ok — it is not a failure.
+  const contentOk = contentPresentDisplay && fetchSucceeded && mainContent.length > 0;
+
+  // Compute extraction_quality label from fill-rate (resolved fields / requested fields)
+  let extractionQuality: "high" | "partial" | "low" | "none" | "n/a" = "n/a";
+  if (fieldResults && fieldResults.length > 0) {
+    // TOW2-258: a low_confidence-suppressed field has value=null (source still "proximity"/etc.);
+    // it is NOT a resolved value, so exclude it from the fill-rate that drives extraction_quality.
+    const matched = fieldResults.filter(r => r.source !== "unresolved" && !r.low_confidence).length;
+    const total = fieldResults.length;
+    if (matched === total) {
+      extractionQuality = "high";
+    } else if (matched === 0) {
+      extractionQuality = "none";
+    } else {
+      // Partial fill: "low" when under half the requested fields resolved, else "partial".
+      // (Avoids labelling 1-of-2 as "low" — that is a genuine partial match.)
+      extractionQuality = matched < total / 2 ? "low" : "partial";
+    }
+  }
+
+  // F14: the honest escalation-failed instruction, shared verbatim by the JSON path and
+  // (via buildContextualAgentInstruction rule 0) the markdown path. Null unless the
+  // escalation fetch genuinely failed.
+  const escalationInstruction = escalationFetchFailed
+    ? buildEscalationFailedInstruction(escalationError, isBrowserConfigured())
+    : null;
+
+  const qLabel = qualityLabel(quality.score);
+  // R4: label used in agent-facing "remember" lines — reflects display-level presence
+  // so a short-but-complete page is not memorised as "low quality".
+  const displayQualityLabel = contentPresentDisplay ? (isShortButComplete ? "ok (brief)" : "ok") : qLabel;
+  // R4: don't surface the raw "content_present:false … below threshold" reason next to
+  // a page we are reporting as present — rewrite it to match the framing. Absent pages
+  // keep the original diagnostic reasons untouched.
+  const displayQualityReasons = isShortButComplete
+    ? [`content_present:true (${contentLen} chars, ${wordCount} words — complete but below the 200char/50word "substantive" bar)`]
+    : quality.quality_reasons;
+
+  // JSON structured output — return early
+  if (params.format === "json") {
+    const jsonResult: Record<string, unknown> = {
+      url: params.url,
+      title,
+      description: description || null,
+      mode: usedMode,
+      source: gitbookMdContent !== null ? "gitbook-md-fallback" : waybackFallback ? "wayback" : "live",
+      fetched_at: fetchedAt,
+      // R4/R7: quality is a signal, not a verdict. `content_present` is the
+      // display-level presence (true whenever real content is in this payload,
+      // including short-but-complete pages). The raw heuristic score + reasons are
+      // kept for callers that want them, but never contradict a successful fetch.
+      quality: {
+        score: quality.score,
+        cleanliness_score: quality.cleanliness_score,
+        content_present: contentPresentDisplay,
+        label: contentPresentDisplay ? "ok" : qLabel,
+        content_ok: contentOk,
+        ...(isShortButComplete ? { note: `short page (${contentLen} chars, ${wordCount} words) — complete but brief` } : {}),
+        reasons: displayQualityReasons,
+      },
+      content: jsonContentField,
+      content_truncated: contentTruncated,
+      // G-2: reflects the ACTUAL length of `content` above (wrapper included) — was
+      // `displayContent.length` pre-wrap, which is what extract.test.ts's
+      // `returned_chars === content.length` invariant asserts; keep that invariant
+      // true by deriving both from the same final string.
+      returned_chars: jsonContentField.length,
+      total_chars: totalChars,
+      structured_data: structuredData ?? null,
+      fields: fieldResults
+        ? Object.fromEntries(fieldResults.map(r => [
+            r.field,
+            {
+              value: r.source === "unresolved" ? null : r.value,
+              source: r.source,
+              confidence: r.confidence,
+              // TOW2-258: a below-floor candidate is suppressed (value null) but surfaced
+              // transparently so the agent can see what was rejected and why.
+              ...(r.low_confidence ? { low_confidence: true } : {}),
+              ...(r.low_confidence_value !== undefined ? { low_confidence_value: r.low_confidence_value } : {}),
+              ...((r.source === "unresolved" || r.low_confidence) && r.agent_instruction ? { agent_instruction: r.agent_instruction } : {}),
+              ...(r.warning ? { warning: r.warning } : {}),
+            },
+          ]))
+        : null,
+      links: { same_domain: sameDomainLinks, total: allLinks.length },
+      hints: [] as string[],
+      ...(pdfPages !== null ? { pdf: { pages: pdfPages, title: pdfTitle ?? null } } : {}),
+      ...(autoEscalated ? { auto_escalated: true, ...(autoEscalatedTo ? { escalated_to: autoEscalatedTo } : {}) } : {}),
+      // F14: when the escalation FETCH failed, the failure is front-and-center — a
+      // top-level agent_instruction (status:failed), not only the buried hints entry.
+      ...(escalationFailed ? { escalation_attempted: true, escalation_failed: true, ...(escalationError ? { escalation_error: escalationError } : {}), ...(escalationInstruction ? { agent_instruction: escalationInstruction } : {}) } : {}),
+      ...(detectedAntiBot ? { anti_bot: detectedAntiBot, escalated: usedMode, resolved: antiBotResolved } : {}),
+      ...(gitbookMdContent !== null ? { gitbook_md_fallback: true } : {}),
+      ...(waybackFallback ? { wayback_fallback: true } : {}),
+      // PARAM-HONESTY: country accepted but not applied — fires only when the caller
+      // supplied it AND it was genuinely dropped (see countryNotApplied above).
+      ...(countryNotApplied ? {
+        country_warning: `country="${params.country}" accepted but not applied — resolved via mode="${usedMode}", not "render" (country only takes effect on render/js fetches; do not rely on it here)`,
+        // F14 invariant: never recommend a render retry when the render escalation just
+        // failed on this very URL — point at the failure instead. When both disclosures
+        // apply, carry both (this spread would otherwise override the escalation one).
+        agent_instruction: `${escalationInstruction ? `${escalationInstruction} | ` : ""}country="${params.country}" was accepted but NOT applied to this extraction (resolved mode: "${usedMode}") — do not rely on it for geo-restricted content.${escalationFetchFailed ? ` A render fetch just failed on this URL (see escalation_error) — resolve that before retrying with country.` : ` Retry with render="render" (or render="js") and country="${params.country}" to have it actually honored; the default auto/static path drops it.`}`,
+      } : {}),
+      // NOV-668: Kufer availability data
+      ...(kuferResult ? {
+        kufer_availability: {
+          is_overview_page: kuferResult.is_overview_page,
+          status: kuferResult.status,
+          raw_text: kuferResult.raw_text,
+          ...(kuferResult.is_overview_page ? {
+            agent_instruction: "Kufer overview page — availability here is NOT reliable (icon alt text is generic). Fetch the individual course detail page for the real status."
+          } : {}),
+        }
+      } : {}),
+      remember: `${title} at ${params.url} — ${displayQualityLabel} quality, ${contentLen} chars`,
+    };
+    // Build hints array
+    const hints = jsonResult.hints as string[];
+    if (redditUrl) hints.push("Reddit URL rewritten to old.reddit.com — new reddit.com blocks all scrapers.");
+    if (gitbookMdContent !== null) hints.push("Content retrieved via GitBook .md fallback — the live page is JS-rendered; the raw markdown endpoint returned richer content.");
+    if (waybackFallback) hints.push("Content retrieved from Wayback Machine (archive.org) — the live page returned empty/blocked content. Data may be outdated.");
+    // F14 invariant: no render-retry advice when the render escalation just failed here.
+    if (countryNotApplied) hints.push(`country="${params.country}" accepted but not applied on this fetch (mode="${usedMode}")${escalationFetchFailed ? " — the render fetch that would honor it just failed (see escalation_error)." : ` — retry with render="render" to have it honored.`}`);
+    try {
+      const extractedHost = new URL(params.url).hostname.replace(/^www\./, "");
+      if (extractedHost === "trends24.in") hints.push("[THIRD-PARTY DATA] trends24.in is an independent aggregator, not an official X/Twitter source.");
+    } catch { /* ignore */ }
+    // F14 invariant: when render already ran and failed (JS-heavy path's render-failed,
+    // or a failed quality escalation), never re-recommend render='js' here.
+    if (stillJsHeavy) hints.push(usedMode === "render-failed" || escalationFailed
+      ? "Page is JavaScript-rendered and the render escalation already failed — do NOT re-send render='js'/render='render'. Use render='browser' (NOVADA_BROWSER_WS) or format='html' instead."
+      : "Page is JavaScript-rendered. Content may be incomplete. Try render='js' or render='browser'.");
+    // INC-199: Surface escalation failure so agents know quality:0 is not silent
+    if (escalationFailed) {
+      hints.push(`Auto-escalation attempted (render${isBrowserConfigured() ? "+browser" : ""}) but quality remained low (${quality.score}/100). ${escalationError ? `Render error: ${escalationError}` : "The page may require a specialized approach."}`);
+      if (!isBrowserConfigured()) hints.push("Set NOVADA_BROWSER_WS to enable Browser API as a final fallback for JS-heavy pages.");
+    }
+    // P2-3: Cross-tool intelligence — suggest better tools when extraction quality is poor.
+    // FIX-3: getScrapeHint is fail-closed — a catalog-absent domain/op (or backend_broken
+    // op) returns null and no hint is emitted, instead of the old fail-open check.
+    if (!contentOk && baseDomain) {
+      const scrapeHint = getScrapeHint(baseDomain);
+      if (scrapeHint) {
+        hints.push(`For structured ${baseDomain} data, try: ${scrapeHint}`);
+      }
+      // NOV-565: never show a bot-protection hint when the page already has full content.
+      if (!quality.content_present && (usedMode === "render-failed" || (stillJsHeavy && !contentOk))) {
+        hints.push(`Page is bot-protected. Try: render="browser" with NOVADA_BROWSER_WS, or format="html" for raw HTML with anti-bot bypass.`);
+      }
+      // FIX-B (2026-07-30): PMC-specific mirror hint — mirrors the markdown path's
+      // buildContextualAgentInstruction wiring. Null (no-op) for every other host.
+      const pmcHint = getPmcMirrorHint(params.url);
+      if (pmcHint) hints.push(pmcHint);
+    }
+    if (isTruncated) hints.push(`Content truncated at ${maxChars} chars (full: ${totalChars}). Pass max_chars=${Math.min(maxChars * 2, 100000)} to get more.`);
+    try { hints.push(`Discover more pages: novada_map(url="${new URL(params.url).origin}")`); } catch { /* ignore */ }
+    // Wire output save — best-effort, never breaks the tool.
+    // Add save path INTO the JSON object (not after it) to keep output parseable.
+    try {
+      const domain = new URL(params.url).hostname.replace("www.", "");
+      const outputResult = await saveOutput({
+        tool: "extract",
+        hint: domain,
+        format: "json",
+        data: jsonResult,
+        project: params.project,
+      });
+      // FIX-1: Redact absolute path.
+      (jsonResult as Record<string, unknown>).output_saved = redactSecrets(outputResult.filePath);
+    } catch { /* best-effort */ }
+
+    const jsonOutput = JSON.stringify(jsonResult, null, 2);
+    setCached(params.url, cacheRenderMode, "json", jsonOutput, params.fields);
+
+    return jsonOutput;
+  }
+
+  // #22: header rows are single-line `key: value`. title/description come from <title>/<h1>
+  // /meta and can carry embedded newlines or whitespace runs (wrapped nav, multi-line meta);
+  // collapse them to a single line so nav-chrome can't split into fake header rows. JSON output
+  // keeps the raw values untouched (proper JSON strings, no header contract to break).
+  const headerLine = (s: string) => s.replace(/\s+/g, " ").trim();
+  // R4: frame quality as a signal, not a verdict. When content is present, the
+  // header reports `quality:ok` (with the numeric score kept as informational
+  // detail) and never says `content_present:false` next to real content. Only a
+  // genuine absence (empty / bot-challenge / JS-empty fetch) is labelled low.
+  const qualityFraming = contentPresentDisplay
+    ? `quality:ok (score:${quality.score}/100) | content_present:true | content_ok:${contentOk}`
+    : `quality:low (score:${quality.score}/100) | content_present:false | content_ok:false`;
+  // A present-but-short page gets ONE informational note instead of a "low"/reasons
+  // line that contradicts the body. Absent pages keep the diagnostic reasons.
+  const qualityDetailLine = contentPresentDisplay
+    ? (isShortButComplete
+        ? `note: short page (${contentLen} chars, ${wordCount} words) — complete but brief; retry render="render" only if you expected more`
+        : null)
+    : `quality_reasons: ${quality.quality_reasons.join("; ")}`;
+  const lines: string[] = [
+    `## Extracted Content`,
+    `url: ${params.url}`,
+    `mode: ${usedMode} | source: ${gitbookMdContent !== null ? "gitbook-md-fallback" : waybackFallback ? "wayback" : "live"} | ${qualityFraming}`,
+    // F14: a failed escalation fetch is FRONT-AND-CENTER — a header line, not only a
+    // buried Agent Hints entry (the eval's exact complaint on quotes.toscrape.com/js/).
+    ...(escalationFetchFailed ? [`escalation_failed: true — auto-escalation to render failed: ${headerLine(redactSecrets(escalationError ?? ""))}`] : []),
+    ...(qualityDetailLine ? [qualityDetailLine] : []),
+    `fetched_at: ${fetchedAt}`,
+    // #22: omit extraction_quality when no fields were requested (n/a is noise).
+    ...(extractionQuality !== "n/a" ? [`extraction_quality: ${extractionQuality}`] : []),
+    `title: ${headerLine(title)}`,
+    ...(description ? [`description: ${headerLine(description)}`] : []),
+    `chars:${contentLen}${isTruncated ? " (truncated)" : ""} | links:${allLinks.length}${autoEscalated ? ` | auto_escalated:true${autoEscalatedTo ? ` | escalated_to:${autoEscalatedTo}` : ""}` : ""}${detectedAntiBot ? ` | anti_bot:${detectedAntiBot} | resolved:${antiBotResolved}` : ""}${pdfPages !== null ? ` | pdf:true | pages:${pdfPages}` : ""}${metaExtra}`,
+    ``,
+  ];
+
+  // PARAM-HONESTY: country accepted but not applied — fires only when supplied AND
+  // genuinely dropped (countryNotApplied computed above from the actual fetch path).
+  if (countryNotApplied) {
+    lines.push(
+      `## Warnings`,
+      JSON.stringify([
+        `country="${params.country}" accepted but not applied — resolved via mode="${usedMode}", not "render" (country only takes effect on render/js fetches; do not rely on it here)`,
+      ]),
+      ``,
+    );
+  }
+
+  lines.push(`---`, ``);
+
+  // Requested Fields block (before Structured Data)
+  if (fieldResults && fieldResults.length > 0) {
+    const allUnresolved = fieldResults.every(r => r.source === "unresolved");
+    if (allUnresolved && fieldResults.length > 0) {
+      lines.push(`## Requested Fields (none resolved)`);
+      lines.push(`Fields [${fieldResults.map(r => r.field).join(', ')}] could not be resolved from JSON-LD, tables, microdata, or page patterns.`);
+      lines.push(`The data may be present in the page content above — read the markdown body directly.`);
+      const firstInstruction = fieldResults.find(r => r.agent_instruction)?.agent_instruction;
+      // F14 invariant: the fallback advice must not re-recommend render when the
+      // auto-escalation already ran on this URL.
+      const fieldsFallback = escalationAttempted
+        ? `For Wikipedia/wiki pages, parse the content body. A render="render" attempt already ran automatically and did not resolve these fields.`
+        : `For Wikipedia/wiki pages, parse the content body. For finance/e-commerce pages, retry with render="render" to fetch JS-rendered values.`;
+      lines.push(`agent_instruction: ${firstInstruction ?? fieldsFallback}`);
+    } else {
+      lines.push(`## Requested Fields`);
+      for (const r of fieldResults) {
+        const sourceTag = sourceAnnotation(r.source);
+        if (r.source === "unresolved") {
+          lines.push(`${r.field}: — *(unresolved)*${r.agent_instruction ? ` — ${r.agent_instruction}` : ""}`);
+        } else if (r.low_confidence) {
+          // TOW2-258: a below-floor candidate is suppressed (value null) but the rejected
+          // candidate is shown so the agent knows what was found and why it was not trusted.
+          lines.push(`${r.field}: — *(low_confidence: suppressed candidate "${r.low_confidence_value}", conf:${r.confidence.toFixed(2)})*${r.agent_instruction ? ` — ${r.agent_instruction}` : ""}`);
+        } else {
+          // P0-3: Strip *(pattern)* annotation from the field value itself
+          const cleanValue = typeof r.value === "string"
+            ? r.value.replace(/ \*\(pattern\)\*/g, "").trimEnd()
+            : r.value;
+          const warningTag = r.warning ? ` *(warning: ${r.warning})*` : "";
+          lines.push(`${r.field}: ${cleanValue}${sourceTag} *(conf:${r.confidence.toFixed(2)})*${warningTag}`);
+        }
+      }
+    }
+    lines.push(``, `---`, ``);
+  }
+
+  // Prepend structured data block if available
+  if (hasStructuredData && structuredData) {
+    lines.push(`## Structured Data`);
+    lines.push(`type: ${structuredData.type}`);
+    for (const [key, value] of Object.entries(structuredData.fields)) {
+      lines.push(`${key}: ${value}`);
+    }
+    lines.push(``, `---`, ``);
+  }
+
+  // NOV-668: inject Kufer availability block when detected
+  if (kuferResult) {
+    lines.push(kuferResult.markdown_block);
+    lines.push(``, `---`, ``);
+  }
+
+  lines.push(wrappedDisplayContent);
+  if (truncationNotice) lines.push(``, truncationNotice);
+
+  if (sameDomainLinks.length > 0) {
+    lines.push(``, `---`, `## Same-Domain Links (${sameDomainLinks.length} of ${allLinks.length})`);
+    for (const link of sameDomainLinks) {
+      lines.push(`- ${link}`);
+    }
+  }
+
+  // Extraction Diagnostics — emit when fields were requested and at least one has a null value.
+  // TOW2-258: a low_confidence suppression has value=null but source!=="unresolved", so gate on
+  // the null value (not the source) — otherwise an all-low-confidence page skips diagnostics.
+  let hasNoHeadingMatchField = false;
+  if (fieldResults && fieldResults.some(r => r.value === null)) {
+    lines.push(``, `---`, `## Extraction Diagnostics`);
+    for (const r of fieldResults) {
+      if (r.source !== "unresolved" && !r.low_confidence) {
+        lines.push(`- ${r.field}: matched ✓ (via ${r.source}, conf:${r.confidence.toFixed(2)})`);
+      } else if (r.low_confidence) {
+        // Suppressed low-confidence candidate: show what was found + why it was not trusted.
+        const attemptedList = r.attempted && r.attempted.length > 0 ? r.attempted.join(" → ") : "none";
+        lines.push(`- ${r.field}: suppressed (low_confidence, via ${r.source}, conf:${r.confidence.toFixed(2)}) — candidate: ${r.low_confidence_value ?? "n/a"} — attempted: ${attemptedList}`);
+        if (r.agent_instruction) lines.push(`  agent_instruction: ${r.agent_instruction}`);
+      } else {
+        const attemptedList = r.attempted && r.attempted.length > 0 ? r.attempted.join(" → ") : "none";
+        // Heading reason adds color to the "why" but the authoritative trail is `attempted`.
+        // Use full mainContent (not display-truncated) to match field extraction's input —
+        // otherwise a heading past the truncation point yields a misleading no_heading hint.
+        const headingResult = matchHeadingSectionWithReason(mainContent, r.field);
+        if (headingResult.reason === "no_heading_match") hasNoHeadingMatchField = true;
+        lines.push(`- ${r.field}: null — attempted: ${attemptedList}`);
+        if (r.agent_instruction) lines.push(`  agent_instruction: ${r.agent_instruction}`);
+      }
+    }
+  }
+
+  lines.push(``);
+  lines.push(`## Agent Memory`);
+  lines.push(`remember: ${title} at ${params.url} — ${displayQualityLabel} quality, ${contentLen} chars`);
+
+  lines.push(``, `---`, `## Agent Hints`);
+  if (redditUrl) {
+    lines.push(`- Reddit URL rewritten to old.reddit.com (static HTML) — new reddit.com blocks all scrapers.`);
+  }
+  // NOV-GB1: surface GitBook .md fallback in markdown output hints
+  if (gitbookMdContent !== null) {
+    lines.push(`- [GITBOOK] Content retrieved via GitBook .md fallback — static HTML was JS-only; raw markdown endpoint returned full content.`);
+  }
+  if (waybackFallback) {
+    lines.push(`- [WAYBACK] Content retrieved from Wayback Machine (archive.org) — the live page returned empty/blocked content. Data may be outdated.`);
+  }
+  // Warn when content is sourced from a known third-party aggregator
+  try {
+    const extractedHost = new URL(params.url).hostname.replace(/^www\./, "");
+    if (extractedHost === "trends24.in") {
+      lines.push(`- [THIRD-PARTY DATA] trends24.in is an independent aggregator, not an official X/Twitter source. Data may lag by minutes and coverage is limited to trending topics only.`);
+    }
+  } catch { /* ignore */ }
+  if (autoEscalated) {
+    lines.push(`- Auto-escalated to render mode (static quality score was < 40). Content above was fetched with JS rendering enabled.`);
+  }
+  // INC-199: Surface escalation failure in markdown output
+  if (escalationFailed) {
+    lines.push(`- [ESCALATION FAILED] Auto-escalation attempted (render${isBrowserConfigured() ? "+browser" : ""}) but quality remained low (${quality.score}/100).${escalationError ? ` Render error: ${escalationError}` : ""}`);
+    // F14 invariant: the render tier was just tried on this URL — say so explicitly so
+    // no other hint's render suggestion is followed.
+    lines.push(`- Do NOT re-attempt render="render" — the auto-escalation already sent it and it did not produce usable content.`);
+    if (!isBrowserConfigured()) {
+      lines.push(`- Set NOVADA_BROWSER_WS to enable Browser API as final fallback for JS-heavy pages.`);
+    }
+  }
+  if (hasNoHeadingMatchField) {
+    lines.push(`- Some fields were not found via heading-match. For list or aggregated pages (bestseller lists, search results, news feeds), data is embedded as inline list items — parse the body markdown directly. Field extraction works best on single-entity pages (product detail pages, GitHub repos, articles).`);
+  }
+  if (pdfPages !== null) {
+    lines.push(`- PDF extracted automatically: ${pdfPages} page(s). pdf_pages:${pdfPages} in metadata above.`);
+    lines.push(`- PDF URLs are extracted automatically — use novada_extract the same way as HTML.`);
+    lines.push(`- For large PDFs (>10MB), try a more specific page URL.`);
+  }
+  if (usedMode === "browser") {
+    lines.push(`- Content fetched via Browser API (CDP). Cost: ~$3/GB — use only when static/render modes fail.`);
+  }
+  if (stillJsHeavy) {
+    if (usedMode === "render-failed") {
+      // Render was already attempted and failed — do NOT suggest retrying with render='render'
+      lines.push(`- [WARNING] Page is JavaScript-rendered. Web Unblocker was attempted but failed.`);
+      if (renderError) lines.push(`- Render error: ${renderError}`);
+      lines.push(`- Do NOT retry with render="render" — it was already tried and failed.`);
+      if (isBrowserConfigured()) {
+        lines.push(`- Try render="browser" to use the Browser API instead. Note: Browser API costs ~$3/GB.`);
+      } else {
+        lines.push(`- To enable browser-level rendering: set NOVADA_BROWSER_WS env var (get credentials at https://dashboard.novada.com/overview/browser/), then retry with render="browser".`);
+        lines.push(`- Also verify NOVADA_WEB_UNBLOCKER_KEY is set correctly.`);
+        lines.push(`- Note: Browser API costs ~$3/GB — use sparingly.`);
+      }
+    } else if (usedMode === "static") {
+      lines.push(`- [WARNING] Page appears JavaScript-rendered. Content above may be incomplete.`);
+      lines.push(`- Retry with render="render" to use Novada Web Unblocker (JS rendering).`);
+      if (!isBrowserConfigured()) {
+        lines.push(`- For full browser rendering (costs ~$3/GB), set NOVADA_BROWSER_WS env var.`);
+      }
+    }
+  }
+  // P2-3: Cross-tool intelligence — suggest better tools when extraction quality is poor.
+  // FIX-3: getScrapeHint is fail-closed — a catalog-absent domain/op (or backend_broken
+  // op) returns null and no hint is emitted, instead of the old fail-open check.
+  if (!contentOk && baseDomain) {
+    const scrapeHint = getScrapeHint(baseDomain);
+    if (scrapeHint) {
+      lines.push(`- For structured ${baseDomain} data, try: ${scrapeHint}`);
+    }
+    // NOV-565: never show a bot-protection hint when the page already has full content.
+    if (!quality.content_present && (usedMode === "render-failed" || (stillJsHeavy && !contentOk))) {
+      lines.push(`- Page is bot-protected. Try: render="browser" with NOVADA_BROWSER_WS, or format="html" for raw HTML with anti-bot bypass.`);
+    }
+  }
+  // R4: only suggest a render retry when content is genuinely ABSENT, not merely
+  // short. A complete-but-brief page (example.com) must not trigger a slow render retry.
+  // F14 invariant: and never when the render escalation was already attempted on this
+  // URL (failed or added nothing) — recommending the mode that just ran is circular.
+  if (!contentPresentDisplay && usedMode === "static" && renderMode === "auto" && !escalationFailed) {
+    lines.push(`- No usable content on static mode — try render="render" for JS-heavy or anti-bot protected pages.`);
+  }
+  if (isTruncated) {
+    lines.push(`- Content was truncated at ${maxChars} chars (full: ${totalChars}). Pass max_chars=${Math.min(maxChars * 2, 100000)} to get more, or use novada_map to find specific subpages.`);
+  }
+  try {
+    lines.push(`- To discover more pages: novada_map with url="${new URL(params.url).origin}"`);
+  } catch { /* ignore */ }
+  if (params.query) {
+    lines.push(`- Query context: "${params.query}". Focus analysis on this topic.`);
+  }
+
+
+  // NOV-672: Context-aware agent_instruction — derive the next action from this call's
+  // actual context rather than emitting a generic tool menu.
+  const agentInstruction = buildContextualAgentInstruction({
+    contentOk,
+    qualityScore: quality.score,
+    contentPresent: contentPresentDisplay,
+    shortButComplete: isShortButComplete,
+    usedMode,
+    renderMode,
+    fieldResults,
+    contentTruncated,
+    maxChars,
+    totalChars,
+    mainContent,
+    params,
+    escalationAttempted,
+    escalationFailed,
+    escalationError,
+    browserConfigured: isBrowserConfigured(),
+  });
+  lines.push(``);
+  lines.push(`## Agent Action`);
+  // PARAM-HONESTY: appended only when country was supplied AND genuinely not applied
+  // (see countryNotApplied above) — never fires when country was honored via render/js.
+  // F14 invariant: when the render escalation just failed here, do not append a
+  // "retry with render" recommendation — point at the failure instead.
+  const countryInstruction = countryNotApplied
+    ? ` country="${params.country}" was accepted but NOT applied (resolved mode: "${usedMode}") — do not rely on it for geo-restricted content.${escalationFetchFailed ? ` A render fetch just failed on this URL (see escalation_failed above) — resolve that before retrying with country.` : ` Retry with render="render" (or render="js") and country="${params.country}" to have it actually honored; the default auto/static path drops it.`}`
+    : "";
+  lines.push(`agent_instruction: ${agentInstruction}${countryInstruction}`);
+  const mdOutput = lines.join("\n");
+
+  // Wire output save — best-effort, never breaks the tool.
+  // Prepend the file path to the HEADER so agents that truncate long responses still see it.
+  let savePrefix = "";
+  try {
+    const domain = new URL(params.url).hostname.replace("www.", "");
+    const outputResult = await saveOutput({
+      tool: "extract",
+      hint: domain,
+      format: "md",
+      data: mdOutput,
+      project: params.project,
+    });
+    // #22: drop the stray leading folder emoji; match the batch path's `path: ` prefix.
+    // FIX-1: Redact absolute path before surfacing to agent.
+    // R1: only emit the `path:` header when a file was ACTUALLY written. On hosted
+    // (Vercel) saveOutput returns an empty filePath — a dangling `path: ` label was
+    // the first thing every response opened with. No file → no prefix.
+    if (outputResult.filePath) {
+      savePrefix = `path: ${redactSecrets(outputResult.filePath)}\n\n`;
+    }
+  } catch { /* best-effort */ }
+
+  const finalOutput = savePrefix + mdOutput;
+  setCached(params.url, cacheRenderMode, cacheFormat, finalOutput, params.fields);
+
+  return finalOutput;
+}
+
+/**
+ * Per-URL entry point with a hard total-request ceiling (TIMEOUTS.TOTAL_REQUEST_CEILING).
+ * Uses Promise.race to guarantee no single URL blocks for more than 45s regardless of
+ * how many auto-escalation steps (static → render → browser) are attempted.
+ * The ceiling is per-URL so batch requests each get their own independent timer.
+ */
+async function extractSingle(
+  params: ExtractParams & { url: string },
+  apiKey?: string
+): Promise<string> {
+  // Runtime SSRF guard for SDK direct callers (MCP path already has Zod validation)
+  const blocked = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/i;
+  if (blocked.test(params.url)) {
+    throw new Error('Blocked: private/internal URLs are not allowed. agent_instruction: Use a public URL.');
+  }
+
+  let ceilingTimer: ReturnType<typeof setTimeout> | null = null;
+  const ceiling = new Promise<never>((_, reject) => {
+    ceilingTimer = setTimeout(
+      () => reject(new Error(`TOTAL_REQUEST_CEILING: extractSingle for ${params.url} exceeded ${TIMEOUTS.TOTAL_REQUEST_CEILING}ms`)),
+      TIMEOUTS.TOTAL_REQUEST_CEILING
+    );
+  });
+  try {
+    const result = await Promise.race([
+      extractSingleInner(params, apiKey),
+      ceiling,
+    ]);
+    return result;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.startsWith("TOTAL_REQUEST_CEILING:")) {
+      // Return a structured error string in the same format as other extraction errors
+      // so callers (batch mode, novadaExtract) get usable output rather than a thrown exception.
+      const ceiling_s = TIMEOUTS.TOTAL_REQUEST_CEILING / 1000;
+      return [
+        `## Extraction Error`,
+        `url: ${params.url}`,
+        `error: Request exceeded the ${ceiling_s}s total ceiling and was aborted.`,
+        ``,
+        `## Agent Action`,
+        `agent_instruction: This URL took too long (>${ceiling_s}s). Try render="static" to skip escalation, or novada_scrape for platform-specific data.`,
+      ].join("\n");
+    }
+    throw err;
+  } finally {
+    if (ceilingTimer !== null) clearTimeout(ceilingTimer);
+  }
+}
+
+function formatJsonExtract(url: string, mode: string, jsonStr: string, maxChars?: number, outputFormat?: string): string {
+  const limit = maxChars ?? MAX_CHARS_DEFAULT;
+  const isTruncated = jsonStr.length > limit;
+  const truncatedStr = isTruncated ? jsonStr.slice(0, limit) : jsonStr;
+  let origin = url;
+  try { origin = new URL(url).origin; } catch { /* ignore */ }
+
+  // M1: when the caller asked for format="json", return a bare, parseable JSON
+  // envelope — NOT a ```json markdown fence. Fencing broke JSON.parse on the
+  // caller side (same class as the search F16 bug). The fetched body is embedded
+  // as parsed JSON when it's valid, else as a raw string so nothing is lost.
+  //
+  // G-2: `content` is only wrapUntrusted-wrapped in the RAW-STRING branch (below).
+  // When jsonStr parses as valid JSON, `content` becomes the parsed structured
+  // object — wrapping would force it back into a string and defeat M1's whole
+  // point (a parseable, structured `content` field). Structured JSON data is a
+  // lower-risk shape than free-form prose for the prompt-injection this wrapper
+  // targets; the raw/unparseable/truncated fallback (the shape closest to
+  // arbitrary fetched text) is what gets marked untrusted.
+  if (outputFormat === "json") {
+    let content: unknown = wrapUntrusted(truncatedStr, url);
+    if (!isTruncated) {
+      try { content = JSON.parse(jsonStr); } catch { /* keep the wrapUntrusted-wrapped raw string above */ }
+    }
+    return JSON.stringify({
+      url,
+      mode,
+      source: "live",
+      content_type: "application/json",
+      content,
+      content_truncated: isTruncated,
+      agent_instruction: `This URL returned JSON, not HTML. 'content' holds the ${isTruncated ? "truncated raw JSON string" : "parsed JSON body"}. To discover more pages call novada_map with url="${origin}".`,
+    }, null, 2);
+  }
+
+  const truncated = isTruncated ? truncatedStr + "\n\n[truncated]" : truncatedStr;
+  return [
+    `## Extracted Content`,
+    `url: ${url}`,
+    `mode: ${mode}`,
+    `format: json (raw)`,
+    ``,
+    `---`,
+    ``,
+    "```json",
+    wrapUntrusted(truncated, url),
+    "```",
+    ``,
+    `---`,
+    `## Agent Hints`,
+    `- This URL returned JSON, not HTML. Showing raw JSON content.`,
+    `- To discover more pages: novada_map with url="${origin}"`,
+  ].join("\n");
+}

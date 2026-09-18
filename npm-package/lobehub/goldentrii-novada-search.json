@@ -1,0 +1,23 @@
+{
+  "author": "Goldentrii",
+  "homepage": "https://github.com/Goldentrii/novada-mcp",
+  "identifier": "goldentrii-novada-search",
+  "manifest": "https://registry.npmjs.org/novada-search/latest",
+  "meta": {
+    "avatar": "🌐",
+    "tags": [
+      "web-search",
+      "web-scraping",
+      "research",
+      "data-extraction",
+      "proxy",
+      "anti-bot",
+      "geo-targeting",
+      "rag",
+      "ai-agents",
+      "crawling"
+    ],
+    "title": "Novada MCP — Web Search, Extract, Crawl & Research",
+    "description": "Real-time web data for AI agents. Search via 5 engines (Google, Bing, DuckDuckGo, Yahoo, Yandex), extract content from any URL (batch mode), crawl websites (BFS/DFS with path filters), map site structure, and run multi-step research with citations. Powered by 100M+ proxy IPs across 195 countries with anti-bot bypass. Includes MCP Prompts and Resources for agent-native workflows."
+  }
+}

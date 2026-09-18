@@ -1,0 +1,87 @@
+# dynamic.yml — routers, middlewares, services (hot-reloaded, watch: true).
+#
+# One host port fronts the whole stack. Highest matching priority wins:
+#
+#   /rest/v1/*                       → postgrest   (telemetry profile)
+#   /mcp, /<key>/mcp, /health,
+#   /authorize, /token, /register,
+#   /.well-known/*, /api/*           → gateway
+#   everything else                  → ui          (ui profile, static pages)
+#
+# A router whose backend is not running (profile off) returns 502 for its own
+# paths only — the other routers are unaffected.
+
+http:
+  routers:
+    # ── Telemetry: Supabase-shaped path → PostgREST's root-level table routes ──
+    telemetry-rest:
+      rule: "PathPrefix(`/rest/v1/`)"
+      priority: 300
+      middlewares:
+        - strip-rest-v1
+      service: postgrest
+
+    # ── The MCP gateway (auth, quota, rate-limit, OAuth, reconcile cron) ──────
+    gateway:
+      rule: >-
+        PathPrefix(`/mcp`)
+        || Path(`/health`)
+        || PathPrefix(`/authorize`)
+        || PathPrefix(`/token`)
+        || PathPrefix(`/register`)
+        || PathPrefix(`/.well-known/`)
+        || PathPrefix(`/api/`)
+      priority: 200
+      service: gateway
+
+    # Path-based auth variant (`/<apikey>/mcp`, the Claude.ai-friendly form).
+    # Needs its own regex router — PathPrefix(`/mcp`) cannot express it.
+    gateway-path-auth:
+      rule: "PathRegexp(`^/[A-Za-z0-9_-]{16,}/mcp$`)"
+      priority: 250
+      service: gateway
+
+    # ── Static landing pages (playground / chat / docs) ───────────────────────
+    ui:
+      rule: "PathPrefix(`/`)"
+      priority: 1
+      middlewares:
+        - clean-urls
+      service: ui
+
+  middlewares:
+    # PostgREST serves each table at the root (/mcp_events); _telemetry.ts posts
+    # to the Supabase shape (/rest/v1/mcp_events).
+    strip-rest-v1:
+      stripPrefix:
+        prefixes:
+          - "/rest/v1"
+
+    # The pages link to /playground, /tools, /faq — Vercel's `cleanUrls: true`.
+    # Map a single extensionless segment onto its .html file so a plain static
+    # file server needs no rewrite logic of its own. Paths containing a dot
+    # (shared.css, og-image.png) do not match and pass through untouched.
+    clean-urls:
+      replacePathRegex:
+        regex: "^/([A-Za-z0-9_-]+)$"
+        replacement: "/$1.html"
+
+  services:
+    gateway:
+      loadBalancer:
+        servers:
+          - url: "http://gateway:8080"
+        # Default, but load-bearing here: the gateway derives its OAuth issuer and
+        # resource-metadata URLs from the Host header. Rewriting it would make them
+        # disagree with the browser's origin.
+        passHostHeader: true
+
+    ui:
+      loadBalancer:
+        servers:
+          - url: "http://ui:80"
+
+    postgrest:
+      loadBalancer:
+        servers:
+          - url: "http://postgrest:3000"

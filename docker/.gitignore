@@ -1,0 +1,4 @@
+# Local stack config — contains the KV shared secret and (optionally) telemetry JWTs.
+.env
+.env.*
+!.env.example

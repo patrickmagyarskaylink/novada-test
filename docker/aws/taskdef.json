@@ -1,0 +1,102 @@
+{
+  "family": "novada-mcp-gateway",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/novada-mcp-task-execution",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/novada-mcp-task",
+  "containerDefinitions": [
+    {
+      "name": "kv",
+      "image": "hiett/serverless-redis-http:0.0.10",
+      "essential": true,
+      "environment": [
+        { "name": "SRH_MODE", "value": "env" },
+        { "name": "SRH_PORT", "value": "8079" },
+        { "name": "PORT", "value": "8079" },
+        { "name": "SRH_MAX_CONNECTIONS", "value": "10" }
+      ],
+      "secrets": [
+        {
+          "name": "SRH_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:eu-central-1:ACCOUNT_ID:secret:novada-mcp/kv-token"
+        },
+        {
+          "name": "SRH_CONNECTION_STRING",
+          "valueFrom": "arn:aws:secretsmanager:eu-central-1:ACCOUNT_ID:secret:novada-mcp/elasticache-url"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "nc -z 127.0.0.1 8079 || exit 1"],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/novada-mcp",
+          "awslogs-region": "eu-central-1",
+          "awslogs-stream-prefix": "kv"
+        }
+      }
+    },
+    {
+      "name": "gateway",
+      "image": "ACCOUNT_ID.dkr.ecr.eu-central-1.amazonaws.com/novada-mcp-gateway:0.9.39",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 8080, "protocol": "tcp" }
+      ],
+      "dependsOn": [
+        { "containerName": "kv", "condition": "HEALTHY" }
+      ],
+      "environment": [
+        { "name": "PORT", "value": "8080" },
+        { "name": "HOST", "value": "0.0.0.0" },
+        { "name": "STUB_AUTH_WARNING_ACCEPTED", "value": "true" },
+        { "name": "KV_REST_API_URL", "value": "http://127.0.0.1:8079" },
+        { "name": "FREE_PLAN_MONTHLY_QUOTA", "value": "1000" },
+        { "name": "RATE_LIMIT_PER_MIN", "value": "60" },
+        { "name": "LOG_LEVEL", "value": "info" },
+        { "name": "NOVADA_API_BASE", "value": "https://api.novada.com" },
+        { "name": "MCP_REQUEST_TIMEOUT_MS", "value": "320000" }
+      ],
+      "secrets": [
+        {
+          "name": "KV_REST_API_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:eu-central-1:ACCOUNT_ID:secret:novada-mcp/kv-token"
+        },
+        {
+          "name": "OAUTH_ENC_KEY",
+          "valueFrom": "arn:aws:secretsmanager:eu-central-1:ACCOUNT_ID:secret:novada-mcp/oauth-enc-key"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "stopTimeout": 40,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/novada-mcp",
+          "awslogs-region": "eu-central-1",
+          "awslogs-stream-prefix": "gateway"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,644 @@
+// ─── MCP Resources ────────────────────────────────────────────────────────────
+// Read-only data agents can access before making tool decisions.
+// Reduces hallucination ("does novada support X?") and fixes LobeHub Resources criterion.
+import { SCRAPER_CATALOG } from "../data/scraper_catalog.js";
+// TOW2-307: single source of truth for the tool count quoted below (was a stale
+// hand-typed "23" in three spots — the registry has grown to 38 since). Importing
+// TOOL_REGISTRY.length instead of hardcoding a number means this can never drift
+// again the way the literal did.
+import { TOOL_REGISTRY } from "../tools/registry.js";
+// 2026-07-30 (ACTIONABLE_ERRORS class fix): reuse the SAME sanitizer tool-call
+// errors already run untrusted strings through before embedding them in an
+// agent_instruction-bearing message (see _core/errors.ts's classifyError ->
+// sanitizeMessage -> sanitizeServerMsg chain). Needed here because `uri` in
+// readResource() is raw, client-controlled resources/read input — without this,
+// a uri containing its own "\nagent_instruction:"-shaped line could inject a
+// fake instruction ahead of the real one below (the exact injection class
+// sanitizeServerMsg's `\nagent_instruction:` rewrite + newline-collapse exists
+// to block for tool errors; resources/read gets no less protection).
+import { sanitizeServerMsg } from "../_core/errors.js";
+export const RESOURCES = [
+    {
+        uri: "novada://engines",
+        name: "Supported Search Engines",
+        description: "List of search engines available in novada_search with characteristics and recommended use cases",
+        mimeType: "text/plain",
+    },
+    {
+        uri: "novada://countries",
+        name: "Supported Country Codes",
+        description: "Country codes for geo-targeted search in novada_search. All 195 ISO 3166-1 alpha-2 country codes, grouped by region.",
+        mimeType: "text/plain",
+    },
+    {
+        uri: "novada://guide",
+        name: "Agent Tool Selection Guide",
+        // TODO(TOW2-307): this prose enumerates only a representative subset of tool
+        // names, not all TOOL_REGISTRY.length tools — a fuller pass should expand (or
+        // explicitly summarize by category) rather than leave the list looking exhaustive.
+        description: `Decision tree and workflow patterns for choosing between all ${TOOL_REGISTRY.length} novada tools: search, extract (incl. raw-HTML render), crawl, map, research, scrape (with novada_discover for platform lookup), proxy (one tool, type param), verify, browser, account (incl. product-activation status), discover`,
+        mimeType: "text/plain",
+    },
+    {
+        uri: "novada://scraper-platforms",
+        name: "Supported Scraper Platforms",
+        description: "Full list of platforms supported by novada_scrape with their operation IDs and required parameters. Read this before calling novada_scrape to find the correct platform and operation for your use case.",
+        mimeType: "text/plain",
+    },
+    {
+        uri: "novada://llms-txt",
+        name: "LLM-Optimized Tool Reference",
+        // TODO(TOW2-307): the actual novada://llms-txt body (below) only documents a
+        // subset of tools, not all TOOL_REGISTRY.length — a fuller pass should add the
+        // missing per-tool paragraphs rather than leave the headline count exhaustive.
+        description: `Concise LLM-friendly reference for all ${TOOL_REGISTRY.length} novada tools. One paragraph per tool with best-for, not-for, required params, and example. Optimized for context injection — 60% shorter than full guide.`,
+        mimeType: "text/plain",
+    },
+    {
+        uri: "novada://privacy",
+        name: "Privacy & Telemetry Disclosure",
+        description: "Exactly what usage metadata the hosted Novada MCP gateway (mcp.novada.com) logs — full field list, what is never collected (search queries, URL paths, page content, parameter values), retention, and contact. The local npm server logs nothing to Novada.",
+        mimeType: "text/plain",
+    },
+];
+// Static category mapping — domain → display category
+const PLATFORM_CATEGORIES = {
+    "amazon.com": "E-Commerce",
+    "walmart.com": "E-Commerce",
+    "shein.com": "E-Commerce",
+    "google.com": "Search Engine",
+    "bing.com": "Search Engine",
+    "duckduckgo.com": "Search Engine",
+    "yandex.com": "Search Engine",
+    "x.com": "Social Media",
+    "tiktok.com": "Social Media",
+    "instagram.com": "Social Media",
+    "facebook.com": "Social Media",
+    "youtube.com": "Social Media",
+    "linkedin.com": "Professional / B2B",
+    "github.com": "Tech / Developer",
+    "chatgpt.com": "AI / Conversational",
+    "perplexity.ai": "AI / Conversational",
+};
+const CATEGORY_ORDER = [
+    "E-Commerce",
+    "Search Engine",
+    "Social Media",
+    "Professional / B2B",
+    "Tech / Developer",
+    "AI / Conversational",
+    "Other",
+];
+function buildScraperPlatformsText() {
+    const lines = [
+        "# Supported Scraper Platforms — novada_scrape",
+        "",
+        "Read this resource to find the correct platform and operation before calling novada_scrape.",
+        "Operation IDs are EXACT — do not guess or invent variants. Verified 2026-07-13.",
+        "",
+        "## How to Use",
+        "1. Find your platform below",
+        "2. Copy the operation exactly as shown — do NOT modify it",
+        "3. Call: novada_scrape({ platform: \"<domain>\", operation: \"<operation_id>\", params: {...} })",
+        "4. Params are wrapped automatically in scraper_params=[{...}] format by the MCP",
+        "",
+        `IMPORTANT: Only these ${SCRAPER_CATALOG.length} platforms have active operations. All others`,
+        "(reddit, glassdoor, zillow, etc.) have 0 scenes and will return error 11006.",
+        "Use novada_extract for unsupported platforms.",
+        "",
+        "---",
+        "",
+    ];
+    // Group by category
+    const byCategory = {};
+    for (const p of SCRAPER_CATALOG) {
+        const cat = PLATFORM_CATEGORIES[p.domain] ?? "Other";
+        if (!byCategory[cat])
+            byCategory[cat] = [];
+        byCategory[cat].push(p);
+    }
+    const cats = [
+        ...CATEGORY_ORDER.filter(c => byCategory[c]),
+        ...Object.keys(byCategory).filter(c => !CATEGORY_ORDER.includes(c)),
+    ];
+    for (const cat of cats) {
+        const platforms = byCategory[cat];
+        if (!platforms?.length)
+            continue;
+        lines.push(`## ${cat}`, "");
+        for (const p of platforms) {
+            lines.push(`### ${p.domain} (platform_id=${p.platform_id})`);
+            const healthy = p.ops.filter(op => op.status === "ok");
+            const broken = p.ops.filter(op => op.status === "backend_broken");
+            for (const op of healthy) {
+                const allParams = op.params.map(param => {
+                    const optMark = param.required ? "" : "?";
+                    return `${param.key}${optMark}: string`;
+                }).join(", ");
+                const paramStr = allParams || "none";
+                lines.push(`- ${op.slug.padEnd(44)} → params: { ${paramStr} }`);
+            }
+            if (broken.length > 0) {
+                lines.push("");
+                lines.push("  Backend-broken (call forwarded with warning — backend may fix any day):");
+                for (const op of broken) {
+                    lines.push(`  - ${op.slug} — ${op.broken_reason ?? "backend failure"}`);
+                }
+            }
+            lines.push("");
+        }
+    }
+    lines.push("---", "");
+    lines.push("## NOT AVAILABLE (0 scenes — use novada_extract instead)");
+    lines.push("reddit.com, glassdoor.com, zillow.com, ebay.com, etsy.com, tripadvisor.com, airbnb.com,");
+    lines.push("booking.com, indeed.com, stackoverflow.com, medium.com, quora.com, and ~91 others.");
+    lines.push("");
+    lines.push("## Common Mistakes");
+    lines.push("- Using invented operation IDs — use ONLY the IDs listed above.");
+    lines.push("- Using reddit/glassdoor/zillow — NOT AVAILABLE, use novada_extract instead.");
+    lines.push("- Error 11006 = either (a) Scraper API not activated, or (b) invalid operation ID. Check the ID first.");
+    lines.push("- Error 11008 = unknown platform name. Use exact domain like \"amazon.com\", \"x.com\".");
+    lines.push("- Error 11009 = wrong request format (flat vs scraper_params). The MCP handles this automatically.");
+    return lines.join("\n");
+}
+export function listResources() {
+    return { resources: RESOURCES };
+}
+export function readResource(uri) {
+    switch (uri) {
+        case "novada://engines":
+            return {
+                contents: [{
+                        uri,
+                        mimeType: "text/plain",
+                        text: `# Supported Search Engines
+
+google     — Best general-purpose engine, highest relevance. Default choice.
+duckduckgo — Privacy-focused, no personalization bias. Good for neutral/unfiltered results.
+yandex     — Best for Russian-language content and Eastern European queries.
+
+## Recommendation
+- Default: google
+- Russian/CIS content: yandex
+- Unbiased results: duckduckgo
+- Always pair with country + language for localized results.`,
+                    }],
+            };
+        case "novada://countries":
+            return {
+                contents: [{
+                        uri,
+                        mimeType: "text/plain",
+                        text: `# Country Codes for Geo-Targeted Search
+Pass as the 'country' parameter in novada_search. 195 countries supported.
+
+## Most Used
+us — United States    gb — United Kingdom    de — Germany
+fr — France           jp — Japan             cn — China
+kr — South Korea      in — India             br — Brazil
+ca — Canada           au — Australia         mx — Mexico
+es — Spain            it — Italy             nl — Netherlands
+
+## Europe
+ad — Andorra          al — Albania           am — Armenia
+at — Austria          az — Azerbaijan        ba — Bosnia & Herzegovina
+be — Belgium          bg — Bulgaria          by — Belarus
+ch — Switzerland      cy — Cyprus            cz — Czech Republic
+de — Germany          dk — Denmark           ee — Estonia
+es — Spain            fi — Finland           fr — France
+gb — United Kingdom   ge — Georgia           gr — Greece
+hr — Croatia          hu — Hungary           ie — Ireland
+is — Iceland          it — Italy             li — Liechtenstein
+lt — Lithuania        lu — Luxembourg        lv — Latvia
+mc — Monaco           md — Moldova           me — Montenegro
+mk — North Macedonia  mt — Malta             nl — Netherlands
+no — Norway           pl — Poland            pt — Portugal
+ro — Romania          rs — Serbia            ru — Russia
+se — Sweden           si — Slovenia          sk — Slovakia
+sm — San Marino       tr — Turkey            ua — Ukraine
+
+## Asia
+ae — UAE              af — Afghanistan       am — Armenia
+az — Azerbaijan       bd — Bangladesh        bh — Bahrain
+bn — Brunei           bt — Bhutan            cn — China
+cy — Cyprus           ge — Georgia           id — Indonesia
+il — Israel           in — India             iq — Iraq
+ir — Iran             jo — Jordan            jp — Japan
+kg — Kyrgyzstan       kh — Cambodia          kp — North Korea
+kr — South Korea      kw — Kuwait            kz — Kazakhstan
+la — Laos             lb — Lebanon           lk — Sri Lanka
+mn — Mongolia         mm — Myanmar           mv — Maldives
+my — Malaysia         np — Nepal             om — Oman
+ph — Philippines      pk — Pakistan          ps — Palestine
+qa — Qatar            sa — Saudi Arabia      sg — Singapore
+sy — Syria            tj — Tajikistan        th — Thailand
+tl — Timor-Leste      tm — Turkmenistan      tr — Turkey
+tw — Taiwan           uz — Uzbekistan        vn — Vietnam
+ye — Yemen
+
+## Americas
+ag — Antigua & Barbuda  ar — Argentina       bb — Barbados
+bh — Belize (BZ)        bo — Bolivia         br — Brazil
+bs — Bahamas            bz — Belize          ca — Canada
+cl — Chile              co — Colombia        cr — Costa Rica
+cu — Cuba               dm — Dominica        do — Dominican Republic
+ec — Ecuador            gd — Grenada         gt — Guatemala
+gy — Guyana             hn — Honduras        ht — Haiti
+jm — Jamaica            kn — Saint Kitts & Nevis  lc — Saint Lucia
+mx — Mexico             ni — Nicaragua       pa — Panama
+pe — Peru               py — Paraguay        sr — Suriname
+sv — El Salvador        tt — Trinidad & Tobago    us — United States
+uy — Uruguay            vc — Saint Vincent   ve — Venezuela
+
+## Africa
+ao — Angola           bf — Burkina Faso      bi — Burundi
+bj — Benin            bw — Botswana          cd — DR Congo
+cf — Central African Rep  cg — Congo         ci — Côte d'Ivoire
+cm — Cameroon         cv — Cape Verde        dj — Djibouti
+dz — Algeria          eg — Egypt             er — Eritrea
+et — Ethiopia         ga — Gabon             gh — Ghana
+gm — Gambia           gn — Guinea            gq — Equatorial Guinea
+gw — Guinea-Bissau    ke — Kenya             km — Comoros
+lr — Liberia          ls — Lesotho           ly — Libya
+ma — Morocco          mg — Madagascar        ml — Mali
+mr — Mauritania       mu — Mauritius         mw — Malawi
+mz — Mozambique       na — Namibia           ne — Niger
+ng — Nigeria          rw — Rwanda            sc — Seychelles
+sd — Sudan            sl — Sierra Leone      sn — Senegal
+so — Somalia          ss — South Sudan       st — São Tomé & Príncipe
+sz — Eswatini         td — Chad              tg — Togo
+tn — Tunisia          tz — Tanzania          ug — Uganda
+za — South Africa     zm — Zambia            zw — Zimbabwe
+
+## Oceania
+au — Australia        fj — Fiji              fm — Micronesia
+ki — Kiribati         mh — Marshall Islands  nr — Nauru
+nz — New Zealand      pg — Papua New Guinea  pw — Palau
+sb — Solomon Islands  to — Tonga             tv — Tuvalu
+vu — Vanuatu          ws — Samoa
+
+Total: 195 countries supported.`,
+                    }],
+            };
+        case "novada://guide":
+            return {
+                contents: [{
+                        uri,
+                        mimeType: "text/plain",
+                        text: `# novada Agent Tool Selection Guide
+
+## Quick Decision Tree
+
+You have a question or topic but no URL?
+  → Simple fact lookup: novada_search
+  → Complex multi-source question: novada_research (depth='auto')
+
+You have a URL and need its content?
+  → novada_extract (pass url as array for batch — up to 10 pages in one call)
+
+You need to know what URLs exist on a site?
+  → novada_map → then novada_extract on chosen URLs
+
+You need content from multiple pages and don't have the URLs yet?
+  → novada_crawl (with select_paths regex to target relevant sections)
+
+You need structured data from a known platform (Amazon, Walmart, TikTok…)?
+  → novada_scrape
+  → Call novada_discover({platform: "<domain>"}) first to find the exact operation ID and required params — it's a tool call, so it works in every MCP client
+  → Bonus: the novada://scraper-platforms resource has the same catalog, for clients that support MCP resources
+
+You need to route your own HTTP requests through a specific IP type?
+  → novada_proxy(type="residential") — real home IP, strongest anti-bot bypass
+  → novada_proxy(type="isp") — ISP-assigned IP, looks like a home user
+  → novada_proxy(type="static") — static residential, same IP every time
+  → novada_proxy(type="datacenter") — fastest, best for non-anti-bot targets
+  → novada_proxy(type="mobile") — 4G/5G mobile IP
+  → novada_proxy(type="dedicated") — exclusive datacenter IP, not shared
+
+You need to scrape a platform and think you need to poll for results?
+  → novada_scrape is synchronous — one call, no submit/status/result dance. Pass task_id from a prior slow call to resume without re-billing.
+
+Which tools are available on your API key?
+  → novada_discover (or novada_account(section="summary") for product activation status)
+
+You need to fact-check whether a claim is true or false?
+  → novada_verify
+
+You have a URL blocked by anti-bot protection and need JS-rendered content directly?
+  → novada_extract with render="render" (Web Unblocker; add format="html" if you need raw HTML)
+
+You need to interact with a page (click buttons, fill forms, navigate, screenshot)?
+  → novada_browser
+  → Use aria_snapshot action to get the page's semantic structure (roles + names) — more stable than CSS selectors and 70% smaller than raw HTML snapshot
+
+Which Novada products are active on your API key?
+  → novada_account(section="summary") (instant status table — use for first-time setup or debugging)
+
+## Tool Comparison
+
+| Tool                      | Use when you have…                   | Output                  | Token cost |
+|---------------------------|--------------------------------------|-------------------------|------------|
+| novada_search             | a question, no URL                   | URL list + snippets     | Low        |
+| novada_extract            | a URL (or list of URLs)              | Full page content       | Medium-High|
+| novada_map                | a domain, need URL list              | URL list only           | Low        |
+| novada_crawl              | a domain, need N pages               | Content of N pages      | High       |
+| novada_research           | a complex question                   | Cited report            | Medium     |
+| novada_scrape             | a supported platform (16 platforms)  | Structured records      | Medium     |
+| novada_proxy(type=...)    | residential/isp/static/datacenter/mobile/dedicated IP needed | Proxy config string | Minimal |
+| novada_verify             | a factual claim to check             | Verdict + evidence URLs | Medium     |
+| novada_extract render=render | a URL blocked by anti-bot         | JS-rendered content     | Medium-High|
+| novada_browser            | interactive page actions             | Action result           | High       |
+| novada_account(section=summary) | check which products are active | Status table + links | Minimal    |
+| novada_discover           | need full tool catalog               | Tool catalog JSON       | Low        |
+
+## Efficient Workflow Patterns
+
+### RAG Pipeline
+novada_search → novada_extract([top 5 urls]) → feed to vector store
+
+### Competitive Analysis
+novada_map competitor.com → novada_crawl with select_paths=['/pricing','/features'] → synthesize
+
+### Current Events
+novada_search with time_range='week' → novada_extract on top results
+
+### Documentation Ingestion
+novada_map docs.example.com → novada_crawl with select_paths=['/docs/api/**']
+
+### Research Report
+novada_research with depth='deep' → novada_extract on 2–3 most relevant sources
+
+### E-commerce Data
+novada_scrape with platform='amazon.com', operation='amazon_product_keywords'
+
+## Common Mistakes to Avoid
+
+- Using novada_extract for URL discovery (use novada_map first — much faster)
+- Using novada_crawl when you only need 1 page (use novada_extract)
+- Calling novada_extract 5 times instead of once with url=[...] array
+- Setting max_pages too high in crawl (large token cost, often unnecessary)
+- Not adding time_range for queries about recent events
+- Using novada_scrape for domains not in the supported platform list (use novada_extract instead)
+
+## Failure Recovery Patterns
+
+### When novada_search returns 0 results
+→ SERP may not be enabled on your API key. Use novada_research or novada_map + novada_extract instead.
+→ Try: novada_verify for fact-checking without search (uses extract-based discovery)
+
+### When novada_extract returns empty or minimal content
+→ Page may be JS-heavy: retry with render="render"
+→ Anti-bot detection: retry with render="browser"
+→ Still empty: retry novada_extract with render="render" and format="html" for raw HTML/DOM
+
+### When novada_scrape returns Error 11006
+→ Scraper API not activated on this account
+→ Activate at: dashboard.novada.com/overview/scraper/
+→ Alternative: novada_extract on the same URL (slower, less structured)
+
+### When novada_browser actions fail
+→ Selector not found: use aria_snapshot first to see current page structure
+→ Element not clickable: add wait action before click (page may still be loading)
+→ Session expired: session_id is stale — start a new session without session_id
+
+## Token Efficiency Tips
+
+1. Batch extract: novada_extract with url=[url1, url2, ...] — up to 10 pages in one call
+2. Use novada_search first: get URLs, then extract only the most relevant 2-3
+3. Use novada_map before novada_crawl: confirm pages exist before fetching content
+4. Use aria_snapshot not snapshot: 70% smaller than raw HTML, easier for agents to parse
+5. For search pipelines: pass only the top 5 results to novada_extract, not all 10`,
+                    }],
+            };
+        case "novada://scraper-platforms":
+            return {
+                contents: [{
+                        uri,
+                        mimeType: "text/plain",
+                        text: buildScraperPlatformsText(),
+                    }],
+            };
+        case "novada://llms-txt":
+            // TODO(TOW2-307): the body below only documents a subset of TOOL_REGISTRY.length
+            // tools (12 at last count) — a fuller pass should add the missing per-tool
+            // paragraphs so the headline count isn't more exhaustive than the content.
+            return {
+                contents: [{
+                        uri,
+                        mimeType: "text/plain",
+                        text: `# Novada MCP — Quick Reference (LLM-optimized)
+> ${TOOL_REGISTRY.length} tools. Read this to pick the right one.
+
+## novada_search
+Best for: web search when you have a question, not a URL. Returns titles+URLs+snippets from 3 engines (Google, DuckDuckGo, Yandex).
+Not for: reading a URL you have (use novada_extract), or full reports (use novada_research).
+Required: query. Optional: engine (default google), num (default 10), time_range.
+Example: novada_search({query: "Claude MCP tutorial 2025", engine: "google", num: 5})
+
+## novada_extract
+Best for: reading content from a URL you already have. Supports batch (up to 10 URLs).
+Not for: discovering URLs (use novada_map), crawling many pages (use novada_crawl).
+Required: url. Optional: render (auto/static/render/browser), fields, max_chars.
+Example: novada_extract({url: "https://docs.example.com/api", render: "auto"})
+
+## novada_crawl
+Best for: multi-page content from a site (e.g. all /docs/* pages). BFS or DFS up to 20 pages.
+Not for: single page (use novada_extract), URL discovery only (use novada_map).
+Required: url. Optional: max_pages (default 5), strategy (bfs/dfs), select_paths.
+Example: novada_crawl({url: "https://docs.example.com", max_pages: 10, select_paths: ["/docs/**"]})
+
+## novada_map
+Best for: discovering all URLs on a site before deciding what to read. Fast — tries sitemap first.
+Not for: reading content (follow with novada_extract or novada_crawl).
+Required: url. Optional: limit (default 50), max_depth.
+Example: novada_map({url: "https://example.com", limit: 100})
+
+## novada_research
+Best for: complex questions needing 3-10 sources. Auto-generates sub-queries, deduplicates, synthesizes.
+Not for: simple single-fact lookup (use novada_search), reading a specific URL (use novada_extract).
+Required: question. Optional: depth (quick/deep/comprehensive/auto), focus.
+Example: novada_research({question: "How do MCP servers work with Claude?", depth: "deep"})
+
+## novada_scrape
+Best for: structured data from 16 active platforms (~87 operations) (Amazon, TikTok, LinkedIn, YouTube, ChatGPT, SHEIN, etc.).
+Not for: arbitrary sites not in the platform list (use novada_extract or novada_crawl).
+Required: platform, operation, params. Optional: format (markdown/json/toon), limit.
+Example: novada_scrape({platform: "amazon.com", operation: "amazon_product_keywords", params: {keyword: "iphone 16"}})
+Tip: Call novada_discover({platform: "<domain>"}) first to find valid operation IDs and params — it's a tool call, so it works in every MCP client. Bonus: the novada://scraper-platforms resource has the same catalog for clients that support MCP resources.
+
+## novada_proxy
+Best for: getting proxy credentials (residential/mobile/ISP/datacenter) for your own HTTP requests.
+Not for: web page extraction (use novada_extract — proxy is automatic there).
+Required: none. Optional: type, country, city, session_id, format (url/env/curl).
+Example: novada_proxy({type: "residential", country: "us", format: "curl"})
+
+## novada_verify
+Best for: fact-checking a claim against web sources. Returns supported/unsupported/contested/insufficient_data.
+Not for: open questions (use novada_research).
+Required: claim (min 10 chars). Optional: context.
+Example: novada_verify({claim: "OpenAI released GPT-5 in 2025", context: "AI industry"})
+
+## novada_extract (raw HTML / bot-protected)
+Best for: raw HTML from a bot-protected or JS-heavy page when you need the DOM, not cleaned text — use render="render" (Web Unblocker) with format="html".
+Not for: cleaned text extraction (use novada_extract with render="render", default format).
+Required: url. Optional: render (auto/static/render/browser), format (markdown/html), country, wait_for, timeout.
+Example: novada_extract({url: "https://example.com/protected", render: "render", format: "html"})
+
+## novada_browser
+Best for: interactive flows — login, click, fill forms, screenshot, scrape behind user actions.
+Not for: simple page reading (use novada_extract).
+Required: actions (array, max 20). Optional: country, timeout, session_id.
+Example: novada_browser({actions: [{action: "navigate", url: "https://example.com"}, {action: "screenshot"}]})
+
+## novada_account
+Best for: diagnosing why a tool fails. section="summary" shows wallet balance, plan quotas, and which Novada products are active on your API key.
+Required: none. Optional: section (summary/balance/usage/plans/traffic).
+Example: novada_account({section: "summary"})
+
+## novada_discover
+Best for: getting the full tool catalog with descriptions, categories, and availability status.
+Not for: checking product activation (use novada_account with section="summary").
+Required: none.
+Example: novada_discover({})
+
+## Quick Decision Tree
+URL you have → novada_extract
+No URL, need search → novada_search
+Many pages → novada_crawl
+Find URLs → novada_map
+Platform data (Amazon/TikTok etc.) → novada_scrape (call novada_discover({platform: "<domain>"}) first for the operation ID)
+Complex question → novada_research
+Fact check → novada_verify
+Raw HTML/DOM → novada_extract with render="render" and format="html"
+Click/interact → novada_browser
+Proxy (residential/isp/static/datacenter/mobile/dedicated) → novada_proxy(type="...")
+Diagnose failure / check product activation → novada_account(section="summary")
+Full tool catalog → novada_discover`,
+                    }],
+            };
+        case "novada://privacy":
+            return {
+                contents: [{
+                        uri,
+                        mimeType: "text/plain",
+                        text: `# Novada MCP — Privacy & Telemetry Disclosure
+
+This document describes exactly what the HOSTED Novada MCP gateway
+(mcp.novada.com) logs about your usage. The local npm server
+(\`npx novada-mcp\`) sends no usage telemetry to Novada — this disclosure
+applies to the hosted gateway only.
+
+## What the hosted gateway logs (mcp_events)
+
+One event per tool call and one per session initialize, with these fields ONLY:
+
+- ts               — server timestamp of the event
+- event_type       — "tool_call" or "initialize"
+- request_id       — random UUID per HTTP request (correlation only)
+- token_hash       — SHA-256 hash of your API key (never the key itself)
+- plan             — "free" or "pro" (billing classification)
+- client_name      — MCP client name from the initialize handshake (e.g. "claude-code")
+- client_version   — MCP client version from the initialize handshake
+- protocol_version — MCP protocol version (currently always null; not exposed per-call)
+- tool             — name of the tool called (e.g. "novada_extract")
+- arg_keys         — parameter NAMES only (e.g. ["url","format"]) — never values
+- target_domain    — for URL-taking tools only: the HOSTNAME of the target URL
+                     (lowercase, leading "www." stripped). Never the path, query
+                     string, port, credentials, or fragment. Null for tools that
+                     take no URL (novada_search queries are not collected at all).
+- outcome          — "ok", an error code, or "cap_blocked"
+- latency_ms       — how long the call took server-side
+- charged          — whether one free-quota unit was consumed
+- over_cap_allowed — whether the call passed via the paid exemption
+- quota_remaining  — free-quota counter after this call
+- server_version   — the gateway build that served the call
+- region           — the serving datacenter region (e.g. "iad1")
+
+## What is NEVER logged
+
+- Search queries (novada_search query text is not collected)
+- Full URLs — no paths, query strings, ports, credentials, or fragments
+- Fetched page content, scrape results, or any tool response body
+- Parameter VALUES of any kind — only parameter names
+- Your API key in plaintext (only its SHA-256 hash)
+
+## Retention
+
+Aggregates are retained; raw events are reviewed for retention policy — see
+the privacy page at https://novada.com for the current policy.
+
+## Why this is collected
+
+Service improvement (which tools and parameters are actually used, latency,
+failure modes) and abuse prevention (cap enforcement, anomalous usage patterns).
+
+## Contact
+
+support@novada.com`,
+                    }],
+            };
+        default: {
+            // ACTIONABLE_ERRORS class fix (2026-07-30, TOW2-353 contract invariant):
+            // this is the only error path REACHABLE INSIDE THIS FUNCTION (enumerated
+            // case by case — listResources() is a static array with no throw; every
+            // known-URI case above builds a static template string with no throw
+            // EXCEPT "novada://scraper-platforms", which calls
+            // buildScraperPlatformsText() — the one matched case with real control
+            // flow (iterates + groups SCRAPER_CATALOG) — and that function is a pure
+            // computation over an already-loaded, already-validated in-memory
+            // constant, with no I/O and no throw site of its own).
+            //
+            // Review round 1 correction (2026-07-30): an EARLIER version of this
+            // comment claimed this was "the ONLY error path on the resources
+            // surface" full stop. That is FALSE and was corrected after independent
+            // review reproduced it live: `resources/read` with a non-string or
+            // MISSING `uri` never reaches this function at all — the MCP SDK's
+            // `ReadResourceRequestSchema` (Zod) rejects it in
+            // `Protocol.setRequestHandler`'s `parseWithCompat()` call, BEFORE
+            // `src/index.ts`'s registered handler (and therefore this function) is
+            // ever invoked, and surfaces a raw Zod-issue dump with NO
+            // agent_instruction. That is a real, separate, currently-un-instrumented
+            // error path on the same `resources/read` method — just enforced one
+            // layer up, outside this file. Investigated giving it an
+            // agent_instruction from `src/index.ts` (the only place that registers
+            // the handler): the SDK offers no interception point for a
+            // schema-rejection response — `setRequestHandler` only exposes
+            // "supply a Zod schema, get a parsed+validated request", so the only way
+            // to intercept this would be replacing the SDK's own
+            // `ReadResourceRequestSchema` with a hand-rolled, more permissive
+            // schema — reimplementing Zod-v3/v4-mini parse-compat semantics
+            // (`parseWithCompat`) and `_meta`/task-augmentation field preservation
+            // outside the SDK's control, for a path only reachable via a
+            // hand-crafted raw JSON-RPC message (no spec-compliant MCP client sends
+            // a non-string/missing uri). That is exactly "hacking SDK internals" for
+            // near-zero real exploitability — not attempted; reported as a gap
+            // instead (see reports/resource-error-actionability-2026-07-30.md's
+            // "Review round 1" section).
+            //
+            // Previously this threw a plain Error with no agent_instruction —
+            // additive fix: preserve the exact original message content when `uri`
+            // doesn't trip sanitizeServerMsg's redaction patterns (a normal/expected
+            // uri never does — see the injection-defense note below for the one
+            // case where the echoed uri IS altered, by design) and append a genuine
+            // agent_instruction line naming the two real ways to discover a valid
+            // URI (resources/list, or one of the ACTUAL advertised URIs computed
+            // from RESOURCES itself — never a hand-typed/invented list that could
+            // drift).
+            const available = RESOURCES.map(r => r.uri).join(", ");
+            // `uri` is untrusted client input (see import comment above) — sanitize
+            // before it's echoed into the message we throw. sanitizeServerMsg is a
+            // no-op for any ordinary uri string; it only rewrites uris that contain
+            // credential-shaped, host-shaped, or (as of the review-round-1 fix)
+            // agent_instruction-line-shaped content — i.e. the "additive-only, exact
+            // original message" property above holds for every uri EXCEPT ones
+            // deliberately crafted to trip those redaction patterns, where altering
+            // the echoed text is the intended defense, not a regression.
+            const safeUri = sanitizeServerMsg(String(uri));
+            throw new Error([
+                `Unknown resource URI: ${safeUri}. Available: ${available}`,
+                `agent_instruction: "Call resources/list to discover valid resource URIs, or use one of the advertised URIs verbatim — ${available}. Do not guess or invent a resource URI."`,
+            ].join("\n"));
+        }
+    }
+}
+//# sourceMappingURL=index.js.map

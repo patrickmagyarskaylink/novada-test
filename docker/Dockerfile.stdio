@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# novada-mcp — stdio image
+#
+# The local MCP server (npm-package/src/index.ts) packaged as a container.
+# Transport is stdio, so it is consumed with `docker run -i` from an MCP client:
+#
+#   {
+#     "mcpServers": {
+#       "novada": {
+#         "command": "docker",
+#         "args": ["run","-i","--rm","-e","NOVADA_API_KEY","novada-mcp:stdio"]
+#       }
+#     }
+#   }
+#
+# No network listener, no database, no shared state — one process per client.
+# Build context is the REPO ROOT:
+#   docker build -f docker/Dockerfile.stdio -t novada-mcp:stdio .
+###############################################################################
+
+ARG NODE_IMAGE=node:22.20.0-bookworm-slim
+
+# ─── 1. build: compile TypeScript → build/ ───────────────────────────────────
+FROM ${NODE_IMAGE} AS build
+WORKDIR /src
+COPY npm-package/package.json npm-package/package-lock.json ./
+# --ignore-scripts: package.json has a `prepare` hook that runs the build; src/ is
+# not in the image yet at this point, so let the explicit build step below do it.
+RUN npm ci --ignore-scripts
+# server.json is REQUIRED at build time: `npm run build` → gen:server-json
+# rewrites its derived fields from build/core.js (see scripts/gen-server-json.mjs).
+COPY npm-package/tsconfig.json npm-package/server.json ./
+COPY npm-package/src ./src
+COPY npm-package/scripts ./scripts
+RUN npm run build
+
+# ─── 2. deps: production-only node_modules ───────────────────────────────────
+FROM ${NODE_IMAGE} AS deps
+WORKDIR /src
+COPY npm-package/package.json npm-package/package-lock.json ./
+# --ignore-scripts: nothing in the dep tree needs a postinstall (playwright-core
+# ships no browser download, unlike playwright), and skipping them keeps the
+# image build hermetic.
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
+# ─── 3. runtime ──────────────────────────────────────────────────────────────
+FROM ${NODE_IMAGE} AS runtime
+ENV NODE_ENV=production \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
+WORKDIR /app
+
+COPY --from=deps  /src/node_modules ./node_modules
+COPY --from=build /src/build        ./build
+COPY --from=build /src/server.json  ./server.json
+COPY npm-package/package.json       ./package.json
+
+# Drop privileges — the `node` user ships with the base image (uid/gid 1000).
+USER node
+
+# stdio transport: the client owns stdin/stdout. Logs go to stderr.
+ENTRYPOINT ["node", "build/index.js"]

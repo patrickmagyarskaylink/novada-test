@@ -1,0 +1,371 @@
+import { novadaSearch, novadaExtract, novadaCrawl, novadaResearch, novadaMap, novadaScrape, novadaVerify } from "../tools/index.js";
+import { withCredentials } from "../utils/credentials.js";
+import type { ToolCredentials } from "../utils/credentials.js";
+// G-2 (no marker leak into the SDK): the tool functions above wrap externally-fetched
+// text with wrapUntrusted/wrapUntrustedInline before returning it — correct for the
+// MCP path (an LLM reads that string directly and needs the "don't follow
+// instructions" marking). NovadaClient instead regex-parses that SAME string into
+// TYPED FIELDS for programmatic TS callers (SearchResult.snippet, ExtractResult.content,
+// ResearchResult.extracted[].content, CrawlPage.content) — those callers read a typed
+// string field, not an LLM prompt, so the marker is pure noise/corruption there
+// (e.g. `result.content.includes(expectedText)` breaks). Every field below that can
+// carry fetched text is run through unwrapUntrusted() so the SDK's public contract is
+// uniformly marker-free while the MCP response these methods call under the hood
+// stays wrapped.
+//
+// HIGH-1 (2026-09-03 adversarial integration pass): the ORIGINAL version of this
+// unwrap only covered 4 of the (then) 7 exposed methods — search/extract/crawl/
+// research — and this comment's "uniformly marker-free" claim was FALSE: scrape()'s
+// `formatted` field (markdown branch — scrape.ts wraps the whole table) and verify()'s
+// `raw` field (verify.ts's pushSourceList wraps every evidence snippet) both returned
+// the wrapped MCP string verbatim. Class-swept against every method NovadaClient
+// exposes (see marker-leak.test.ts's class-driven walker): search/extract/batchExtract/
+// crawl/research/map/scrape/verify/proxy. map() and proxy() never touch fetched text
+// (urls[] / locally-constructed proxy fields) — nothing to unwrap there.
+import { unwrapUntrusted } from "../utils/untrusted.js";
+import type {
+  NovadaClientConfig, SearchResult, ExtractResult, CrawlPage,
+  ResearchResult, MapResult, ProxyConfig, ScrapeResult, VerifyResult,
+} from "./types.js";
+
+/**
+ * NovadaClient — TypeScript SDK for Novada web intelligence APIs.
+ *
+ * Install: npm install novada
+ * Import:  import { NovadaClient } from 'novada/sdk'
+ */
+export class NovadaClient {
+  private config: NovadaClientConfig;
+  private toolCreds: ToolCredentials;
+
+  constructor(config: NovadaClientConfig) {
+    this.config = config;
+    this.toolCreds = {
+      webUnblockerKey: config.webUnblockerKey,
+      browserWs: config.browserWs,
+      proxyUser: config.proxy?.user,
+      proxyPass: config.proxy?.pass,
+      proxyEndpoint: config.proxy?.endpoint,
+    };
+  }
+
+  /** Search the web. Returns typed array of results. */
+  async search(
+    query: string,
+    options: { engine?: "google" | "duckduckgo" | "yandex"; num?: number; country?: string; timeRange?: "day" | "week" | "month" | "year" } = {}
+  ): Promise<SearchResult[]> {
+    return withCredentials(this.toolCreds, async () => {
+      const raw = await novadaSearch(
+        {
+          query,
+          engine: options.engine ?? "google",
+          num: options.num ?? 10,
+          country: options.country ?? "",
+          language: "",
+          format: "json",
+          time_range: options.timeRange,
+        },
+        this.config.scraperApiKey
+      );
+
+      // NOV-852: consume novadaSearch's structured format:"json" output instead
+      // of re-parsing its rendered markdown. The prior parser looked for a
+      // `### N.` header plus separate `url:`/`snippet:` lines — markdown search
+      // actually renders `## N. [title](url)` followed directly by the snippet
+      // text, so the regex never matched and search() silently returned []
+      // for every query. Reading the tool's typed `results[]` field is both the
+      // fix and the more robust long-term contract: it tracks the JSON schema
+      // (rank/title/url/snippet/published) instead of a markdown rendering that
+      // can change independently.
+      //
+      // A few tool-level branches (invalid `engine` param, SERP entitlement
+      // failure) emit a hardcoded markdown message regardless of the requested
+      // format. Parse defensively so any non-JSON or unexpected shape degrades
+      // to [] rather than throwing — callers should never see a JSON.parse
+      // exception surface out of a routine "no results" response.
+      let parsed: { results?: unknown } | undefined;
+      try {
+        parsed = JSON.parse(raw) as { results?: unknown };
+      } catch {
+        return [];
+      }
+      if (!parsed || !Array.isArray(parsed.results)) return [];
+
+      const results: SearchResult[] = [];
+      for (const item of parsed.results as Array<Record<string, unknown>>) {
+        const url = item?.url;
+        if (typeof url !== "string" || !url) continue;
+        const title = typeof item.title === "string" ? item.title : "";
+        // G-2: search.ts wraps `snippet` (fetched SERP text) with wrapUntrusted for
+        // the MCP path — strip it here so the SDK's typed field is marker-free.
+        const snippet = typeof item.snippet === "string" ? unwrapUntrusted(item.snippet) : "";
+        const published = typeof item.published === "string" ? item.published : undefined;
+        results.push({ title, url, snippet, ...(published ? { published } : {}) });
+      }
+      return results;
+    });
+  }
+
+  /** Extract content from a URL. Returns typed ExtractResult. */
+  async extract(
+    url: string,
+    options: { format?: "text" | "markdown" | "html"; query?: string; render?: "auto" | "static" | "render" | "browser" } = {}
+  ): Promise<ExtractResult> {
+    return withCredentials(this.toolCreds, async () => {
+      const raw = await novadaExtract(
+        { url, format: options.format ?? "markdown", query: options.query, render: options.render ?? "auto" },
+        this.config.scraperApiKey
+      );
+
+      const modeMatch = raw.match(/\| mode:([\w-]+)/);
+      const mode = (modeMatch?.[1] as ExtractResult["mode"]) ?? "static";
+      const titleMatch = raw.match(/\ntitle: (.+)/);
+      const descMatch = raw.match(/\ndescription: (.+)/);
+      const charsMatch = raw.match(/chars:(\d+)/);
+
+      // Content is the section immediately before ## Same-Domain Links or ## Agent Hints.
+      // The output may have multiple \n---\n separators (Requested Fields, Structured Data blocks),
+      // so we cannot rely on parts[1]. Instead, find the last content block before agent sections.
+      let content = "";
+      const sectionBreaks = ["## Same-Domain Links", "## Agent Hints"];
+      let contentEnd = raw.length;
+      for (const marker of sectionBreaks) {
+        const idx = raw.indexOf(`\n---\n${marker}`);
+        if (idx !== -1 && idx < contentEnd) contentEnd = idx;
+      }
+      // Content starts after the last \n---\n before the content block
+      const beforeContent = raw.slice(0, contentEnd);
+      const lastSep = beforeContent.lastIndexOf("\n---\n");
+      if (lastSep !== -1) {
+        content = raw.slice(lastSep + 5, contentEnd).trim();
+      }
+      // G-2: extract.ts wraps this body with wrapUntrusted for the MCP path — strip
+      // it so ExtractResult.content is the plain fetched text for typed TS callers.
+      content = unwrapUntrusted(content);
+
+      const links: string[] = [];
+      const linkSection = raw.split("## Same-Domain Links")[1];
+      if (linkSection) {
+        for (const m of linkSection.matchAll(/^- (https?:\/\/\S+)$/gm)) links.push(m[1]);
+      }
+
+      return {
+        url,
+        title: titleMatch?.[1]?.trim() ?? "",
+        description: descMatch?.[1]?.trim() ?? "",
+        content,
+        links,
+        mode,
+        chars: parseInt(charsMatch?.[1] ?? "0", 10),
+      };
+    });
+  }
+
+  /** Extract multiple URLs in parallel. Max 10 URLs per call. Throws if limit exceeded. */
+  async batchExtract(
+    urls: string[],
+    options: { format?: "text" | "markdown" | "html"; query?: string } = {}
+  ): Promise<ExtractResult[]> {
+    if (urls.length > 10) {
+      throw new Error(`batchExtract limit is 10 URLs per call. Received ${urls.length}. Split into chunks and call batchExtract multiple times.`);
+    }
+    return Promise.all(urls.map(url => this.extract(url, options)));
+  }
+
+  /** Crawl a website and return typed page array. */
+  async crawl(
+    url: string,
+    options: { maxPages?: number; strategy?: "bfs" | "dfs"; render?: "auto" | "static" | "render" } = {}
+  ): Promise<CrawlPage[]> {
+    return withCredentials(this.toolCreds, async () => {
+      const raw = await novadaCrawl(
+        {
+          url,
+          max_pages: options.maxPages ?? 5,
+          strategy: options.strategy ?? "bfs",
+          format: "markdown",
+          render: options.render ?? "auto",
+        },
+        this.config.scraperApiKey
+      );
+
+      const pages: CrawlPage[] = [];
+      const blocks = raw.split(/\n### \[\d+\/\d+\] /).slice(1);
+      for (const block of blocks) {
+        const lines = block.split("\n");
+        const pageUrl = lines[0]?.trim() ?? "";
+        const titleLine = lines.find(l => l.startsWith("title:"))?.replace("title:", "").trim() ?? "";
+        const depthMatch = block.match(/depth:(\d+)/);
+        const wordsMatch = block.match(/words:(\d+)/);
+        // G-2: crawl.ts wraps each page's body with wrapUntrusted for the MCP path
+        // (crawl.ts has carried this since before the G-2 audit) — strip it so
+        // CrawlPage.content is uniformly marker-free like every other SDK field.
+        const content = unwrapUntrusted(lines.slice(3).join("\n").split("---")[0].trim());
+        if (pageUrl) {
+          pages.push({
+            url: pageUrl,
+            title: titleLine,
+            content,
+            depth: parseInt(depthMatch?.[1] ?? "0", 10),
+            wordCount: parseInt(wordsMatch?.[1] ?? "0", 10),
+          });
+        }
+      }
+      return pages;
+    });
+  }
+
+  /** Multi-step research. Returns structured report. */
+  async research(
+    question: string,
+    options: { depth?: "quick" | "deep" | "auto" | "comprehensive"; focus?: string } = {}
+  ): Promise<ResearchResult> {
+    return withCredentials(this.toolCreds, async () => {
+      const raw = await novadaResearch(
+        { question, depth: options.depth ?? "auto", focus: options.focus },
+        this.config.scraperApiKey
+      );
+
+      const sources: ResearchResult["sources"] = [];
+      const sourceSection = raw.split("## Key Findings")[1]?.split("## Key Sources")[0] ?? raw.split("## Source Index")[1]?.split("## Key Sources")[0] ?? "";
+      for (const m of sourceSection.matchAll(/\*\*(.+?)\*\*\n\s+(https?:\/\/\S+)\n\s+(.+?)(?:\n|$)/gs)) {
+        sources.push({ title: m[1], url: m[2], snippet: m[3].trim() });
+      }
+
+      const extracted: ResearchResult["extracted"] = [];
+      const extractedSection = raw.split("## Key Sources (Extracted)")[1]?.split("## Sources")[0]?.split("## All Sources")[0] ?? "";
+      for (const block of extractedSection.split(/\n### \[\d+\] /).slice(1)) {
+        const title = block.split("\n")[0]?.trim() ?? "";
+        const url = block.match(/url: (.+)/)?.[1]?.trim() ?? "";
+        // G-2: research.ts wraps each cited excerpt with wrapUntrusted for the MCP
+        // path — strip it so ResearchResult.extracted[].content is marker-free.
+        const content = unwrapUntrusted(block.split("\n").slice(3).join("\n").split("---")[0].trim());
+        if (title && url) extracted.push({ title, url, content });
+      }
+
+      const queries: string[] = [];
+      const queriesSection = raw.split("## Search Queries Used")[1]?.split(/## (Key Findings|Source Index)/)[0] ?? "";
+      for (const m of queriesSection.matchAll(/^\d+\.\s+(.+)$/gm)) queries.push(m[1]);
+
+      return { question, depth: options.depth ?? "auto", sources, extracted, queriesUsed: queries };
+    });
+  }
+
+  /** Discover all URLs on a website. */
+  async map(
+    url: string,
+    options: { search?: string; limit?: number; maxDepth?: number } = {}
+  ): Promise<MapResult> {
+    return withCredentials(this.toolCreds, async () => {
+      const raw = await novadaMap(
+        { url, search: options.search, limit: options.limit ?? 50, include_subdomains: false, max_depth: options.maxDepth ?? 2 },
+        this.config.scraperApiKey
+      );
+
+      const urls: string[] = [];
+      for (const m of raw.matchAll(/^\d+\.\s+(https?:\/\/\S+)$/gm)) urls.push(m[1]);
+
+      const filteredMatch = raw.match(/urls:\d+\s+\(filtered.*?from (\d+) total\)/);
+
+      return { root: url, urls, ...(filteredMatch ? { filtered: parseInt(filteredMatch[1], 10) } : {}) };
+    });
+  }
+
+  /**
+   * Scrape structured data from 13 supported platforms.
+   * Returns raw records array plus the formatted string output.
+   */
+  async scrape(
+    platform: string,
+    operation: string,
+    params: Record<string, unknown> = {},
+    options: { format?: "markdown" | "json" | "csv" | "html" | "xlsx"; limit?: number } = {}
+  ): Promise<ScrapeResult> {
+    return withCredentials(this.toolCreds, async () => {
+      const formatted = await novadaScrape(
+        {
+          platform,
+          operation,
+          params,
+          format: options.format ?? "json",
+          limit: options.limit ?? 20,
+        },
+        this.config.scraperApiKey
+      );
+
+      // Parse JSON fenced block if format=json
+      const jsonMatch = formatted.match(/```json\n([\s\S]+?)\n```/);
+      let records: Record<string, unknown>[] = [];
+      if (jsonMatch) {
+        try { records = JSON.parse(jsonMatch[1]); } catch { /* keep empty */ }
+      }
+
+      // G-2 follow-up (HIGH-1, 2026-09 audit): scrape.ts's "markdown" format
+      // branch wraps its table with wrapUntrusted (json/csv/html/toon are
+      // deliberately NOT wrapped — machine-consumption contract, see
+      // scrape.ts's own comment); `formatted` is a documented public field
+      // (sdk/types.ts) callers read directly, same class as content/snippet
+      // below. unwrapUntrusted is a no-op for the non-markdown formats.
+      return { platform, operation, records, formatted: unwrapUntrusted(formatted) };
+    });
+  }
+
+  /** Verify a factual claim against live web sources. Returns verdict + confidence. */
+  async verify(claim: string, context?: string): Promise<VerifyResult> {
+    return withCredentials(this.toolCreds, async () => {
+      const raw = await novadaVerify(
+        { claim, context },
+        this.config.scraperApiKey
+      );
+
+      // Parse verdict from output: "verdict: supported" etc.
+      const verdictMatch = raw.match(/^verdict:\s*(supported|unsupported|contested|insufficient_data)/m);
+      const verdict = (verdictMatch?.[1] ?? "insufficient_data") as VerifyResult["verdict"];
+
+      // Parse confidence from output: "confidence: 73"
+      const confidenceMatch = raw.match(/^confidence:\s*(\d+)/m);
+      const confidence = parseInt(confidenceMatch?.[1] ?? "0", 10);
+
+      // G-2 follow-up (HIGH-1, 2026-09 audit): verify.ts's pushSourceList wraps
+      // every evidence snippet it renders into the output with wrapUntrusted —
+      // `raw` is documented (sdk/types.ts) as "Full formatted output from
+      // novada_verify" and returned VERBATIM to typed TS callers, so it leaked
+      // the "<!-- BEGIN EXTERNAL CONTENT -->" marker uniformly with every other
+      // SDK field. Strip it here, same as every other unwrap in this file.
+      return { claim, verdict, confidence, raw: unwrapUntrusted(raw) };
+    });
+  }
+
+  /** Get proxy configuration for use in HTTP clients. Throws if proxy not configured. */
+  proxy(
+    options: { type?: "residential" | "mobile" | "isp" | "datacenter"; country?: string; sessionId?: string } = {}
+  ): ProxyConfig {
+    if (!this.config.proxy) {
+      throw new Error(
+        "Proxy credentials not configured. Pass proxy: { user, pass, endpoint } to NovadaClient constructor."
+      );
+    }
+
+    const { user, pass, endpoint } = this.config.proxy;
+    const type = options.type ?? "residential";
+    const parts = [user];
+    if (options.country) parts.push(`country-${options.country.toLowerCase()}`);
+    if (options.sessionId) parts.push(`session-${options.sessionId}`);
+    const username = parts.join("-");
+    const proxyUrl = `http://${encodeURIComponent(username)}:${encodeURIComponent(pass)}@${endpoint}`;
+
+    return {
+      proxyUrl,
+      username,
+      endpoint,
+      type,
+      ...(options.country ? { country: options.country } : {}),
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+    };
+  }
+}
+
+export type {
+  NovadaClientConfig, SearchResult, ExtractResult, CrawlPage,
+  ResearchResult, MapResult, ProxyConfig, ScrapeResult, VerifyResult,
+} from "./types.js";
